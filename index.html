@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cardputer ADV — Hacker Green UI</title>
+<meta name="description" content="A NuttX firmware UI for the M5 Cardputer ADV (ESP32-S3) with a fixed phosphor-green theme.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --phosphor:#00FF41;
+    --phosphor-dim:#0a9a2c;
+    --phosphor-ghost:#0b4d1d;
+    --bg:#040804;
+    --bg-screen:#071107;
+    --panel:#081208;
+    --line:#103b18;
+    --amber:#ffb000;
+    --red:#ff3b30;
+    --text-dim:#5f9a6e;
+    --mono:'JetBrains Mono',ui-monospace,'SFMono-Regular',Menlo,Consolas,monospace;
+  }
+
+  *{box-sizing:border-box;margin:0;padding:0}
+
+  html{scroll-behavior:smooth}
+
+  body{
+    background:var(--bg);
+    color:var(--phosphor);
+    font-family:var(--mono);
+    font-weight:400;
+    line-height:1.6;
+    letter-spacing:.02em;
+    overflow-x:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  /* ---- CRT overlay ---- */
+  .crt-scanlines{
+    position:fixed;inset:0;z-index:9000;pointer-events:none;
+    background:repeating-linear-gradient(
+      to bottom,
+      rgba(0,0,0,0) 0px,
+      rgba(0,0,0,0) 2px,
+      rgba(0,0,0,.18) 3px,
+      rgba(0,0,0,.18) 3px);
+    mix-blend-mode:multiply;
+  }
+  .crt-vignette{
+    position:fixed;inset:0;z-index:9001;pointer-events:none;
+    background:radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,.55) 100%);
+  }
+  .crt-flicker{
+    position:fixed;inset:0;z-index:9002;pointer-events:none;
+    background:var(--phosphor);opacity:0;
+    animation:flicker 6s infinite steps(1);
+  }
+  @keyframes flicker{
+    0%,100%{opacity:0}
+    49.9%{opacity:0}
+    50%{opacity:.012}
+    50.4%{opacity:0}
+    78%{opacity:0}
+    78.2%{opacity:.018}
+    78.5%{opacity:0}
+  }
+
+  /* ---- Boot sequence ---- */
+  #boot{
+    position:fixed;inset:0;z-index:9500;background:var(--bg);
+    padding:6vh 7vw;font-size:14px;color:var(--phosphor);
+    text-shadow:0 0 6px rgba(0,255,65,.5);
+    overflow:hidden;
+  }
+  #boot .line{white-space:pre-wrap;opacity:0}
+  #boot .line.show{opacity:1}
+  #boot .ok{color:var(--phosphor)}
+  #boot .muted{color:var(--text-dim)}
+  body.booted #boot{opacity:0;pointer-events:none;transition:opacity .5s ease .1s}
+
+  /* ---- shell ---- */
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+
+  .glow{text-shadow:0 0 8px rgba(0,255,65,.55),0 0 22px rgba(0,255,65,.18)}
+
+  /* ---- top bar ---- */
+  header.bar{
+    position:sticky;top:0;z-index:200;
+    background:rgba(4,8,4,.82);backdrop-filter:blur(6px);
+    border-bottom:1px solid var(--line);
+  }
+  .bar-in{display:flex;align-items:center;justify-content:space-between;height:54px;gap:16px}
+  .brand{font-weight:800;letter-spacing:.06em;font-size:15px;display:flex;align-items:center;gap:10px}
+  .brand .dot{width:9px;height:9px;border-radius:2px;background:var(--phosphor);box-shadow:0 0 10px var(--phosphor);animation:pulse 1.8s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .bar nav{display:flex;gap:22px;font-size:13px}
+  .bar nav a{color:var(--text-dim);text-decoration:none;transition:color .15s}
+  .bar nav a:hover{color:var(--phosphor)}
+  .bar .repo{
+    border:1px solid var(--phosphor-dim);color:var(--phosphor);
+    text-decoration:none;font-size:12px;font-weight:600;
+    padding:7px 13px;border-radius:3px;transition:.15s;
+  }
+  .bar .repo:hover{background:var(--phosphor);color:#020402;box-shadow:0 0 16px rgba(0,255,65,.5)}
+
+  /* ---- hero ---- */
+  .hero{padding:72px 0 64px;display:grid;grid-template-columns:1.05fr .95fr;gap:56px;align-items:center}
+  .eyebrow{
+    font-size:12px;letter-spacing:.32em;color:var(--phosphor-dim);
+    text-transform:uppercase;margin-bottom:22px;display:flex;align-items:center;gap:10px;
+  }
+  .eyebrow::before{content:"";width:34px;height:1px;background:var(--phosphor-dim)}
+  h1{
+    font-size:clamp(38px,6vw,68px);line-height:1.02;font-weight:800;
+    letter-spacing:-.01em;margin-bottom:24px;
+  }
+  h1 .a{color:var(--phosphor)}
+  h1 .b{color:#fff;text-shadow:0 0 10px rgba(255,255,255,.25)}
+  .lede{font-size:16px;color:var(--text-dim);max-width:46ch;margin-bottom:14px}
+  .lede b{color:var(--phosphor);font-weight:600}
+  .hero-meta{display:flex;gap:26px;margin-top:30px;flex-wrap:wrap}
+  .hero-meta div{font-size:12px;color:var(--text-dim)}
+  .hero-meta span{display:block;font-size:19px;color:var(--phosphor);font-weight:700;margin-top:3px}
+
+  /* ---- device mockup (the signature) ---- */
+  .device{justify-self:center;width:100%;max-width:440px}
+  .bezel{
+    background:linear-gradient(160deg,#1b1f1a,#0c0f0b);
+    border:1px solid #2a3328;border-radius:16px;padding:18px;
+    box-shadow:0 30px 70px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.04);
+    position:relative;
+  }
+  .bezel::after{
+    content:"CARDPUTER ADV";position:absolute;bottom:9px;right:18px;
+    font-size:8px;letter-spacing:.28em;color:#3a4438;
+  }
+  .screen{
+    aspect-ratio:240/135;background:var(--bg-screen);border-radius:6px;
+    border:1px solid #14301a;overflow:hidden;position:relative;
+    box-shadow:inset 0 0 26px rgba(0,0,0,.85);
+    padding:0;
+    font-size:clamp(9px,2.4vw,12px);line-height:1.55;
+  }
+  .screen .sl{position:absolute;inset:0;pointer-events:none;z-index:5;
+    background:repeating-linear-gradient(to bottom,rgba(0,0,0,0) 0 2px,rgba(0,0,0,.22) 2px 3px)}
+  /* status bar */
+  .statusbar{
+    display:flex;justify-content:space-between;align-items:center;
+    background:var(--phosphor);color:#041007;padding:3px 8px;font-weight:700;
+    letter-spacing:.06em;font-size:.92em;
+  }
+  .batt{display:flex;align-items:center;gap:5px}
+  .batt .cell{width:26px;height:8px;border:1px solid #041007;position:relative;border-radius:1px}
+  .batt .cell::after{content:"";position:absolute;top:1px;bottom:1px;left:1px;width:var(--lvl,80%);background:#041007}
+  .menu{padding:8px 8px 0}
+  .menu .row{
+    display:flex;gap:8px;padding:1px 6px;color:var(--phosphor);
+    text-shadow:0 0 6px rgba(0,255,65,.45);
+  }
+  .menu .row .ic{color:var(--phosphor-dim)}
+  .menu .row.sel{background:var(--phosphor);color:#041007;text-shadow:none;border-radius:2px}
+  .menu .row.sel .ic{color:#041007}
+  .device-cap{text-align:center;font-size:11px;color:var(--text-dim);margin-top:16px;letter-spacing:.04em}
+
+  /* ---- section frame ---- */
+  section{padding:64px 0;border-top:1px solid var(--line)}
+  .sec-head{display:flex;align-items:baseline;gap:14px;margin-bottom:36px}
+  .sec-head .num{font-size:12px;color:var(--phosphor-dim);font-weight:700;letter-spacing:.1em}
+  .sec-head h2{font-size:clamp(22px,3vw,30px);font-weight:700;letter-spacing:-.01em}
+  .sec-head .rule{flex:1;height:1px;background:var(--line);align-self:center}
+
+  /* ---- hardware grid ---- */
+  .hw{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1px;background:var(--line);border:1px solid var(--line)}
+  .hw .cell-hw{background:var(--panel);padding:18px 20px}
+  .hw .k{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--phosphor-dim);margin-bottom:8px}
+  .hw .v{font-size:14px;color:var(--phosphor)}
+  .hw .v small{color:var(--text-dim);display:block;font-size:12px;margin-top:3px;line-height:1.5}
+
+  .adv-note{
+    margin-top:22px;border-left:2px solid var(--amber);padding:14px 18px;
+    background:rgba(255,176,0,.05);font-size:13px;color:#cfae6e;
+  }
+  .adv-note b{color:var(--amber)}
+
+  /* ---- features ---- */
+  .feat{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+  .feat .f{border:1px solid var(--line);padding:22px;border-radius:4px;background:var(--panel);transition:.18s}
+  .feat .f:hover{border-color:var(--phosphor-dim);box-shadow:0 0 24px rgba(0,255,65,.08)}
+  .feat .f .t{font-weight:700;font-size:15px;margin-bottom:9px;display:flex;align-items:center;gap:9px}
+  .feat .f .t::before{content:"▸";color:var(--phosphor)}
+  .feat .f p{font-size:13px;color:var(--text-dim);line-height:1.6}
+
+  /* ---- apps ---- */
+  .apps{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+  .app{border:1px solid var(--line);border-radius:4px;background:var(--panel);overflow:hidden;transition:.18s}
+  .app:hover{border-color:var(--phosphor-dim)}
+  .app .hd{display:flex;align-items:center;justify-content:space-between;
+    padding:11px 16px;background:rgba(0,255,65,.06);border-bottom:1px solid var(--line)}
+  .app .hd .nm{font-weight:700;font-size:14px}
+  .app .hd .ix{font-size:11px;color:var(--phosphor-dim);font-weight:700}
+  .app .bd{padding:14px 16px;font-size:13px;color:var(--text-dim);line-height:1.6}
+
+  /* ---- terminal block ---- */
+  .term{
+    background:#020602;border:1px solid var(--line);border-radius:6px;overflow:hidden;
+    box-shadow:0 20px 50px rgba(0,0,0,.5);
+  }
+  .term .top{display:flex;align-items:center;gap:7px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .term .top i{width:10px;height:10px;border-radius:50%;display:inline-block;opacity:.7}
+  .term .top .r{background:var(--red)}.term .top .y{background:var(--amber)}.term .top .g{background:var(--phosphor)}
+  .term .top .ttl{margin-left:8px;font-size:11px;color:var(--text-dim);letter-spacing:.1em}
+  .term .body{padding:20px 22px;font-size:13px;line-height:1.85;overflow-x:auto}
+  .term .body .pr{color:var(--phosphor)}
+  .term .body .pr::before{content:"$ ";color:var(--phosphor-dim)}
+  .term .body .cm{color:#fff}
+  .term .body .cmt{color:var(--text-dim)}
+  .term .body .out{color:var(--phosphor-dim)}
+
+  /* ---- keymap ---- */
+  .keys{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .key{border:1px solid var(--line);border-radius:4px;padding:16px;background:var(--panel);text-align:center}
+  .kcap{display:inline-block;border:1px solid var(--phosphor-dim);border-bottom-width:3px;
+    border-radius:4px;padding:4px 10px;font-weight:700;font-size:13px;margin-bottom:10px;color:var(--phosphor)}
+  .key .act{font-size:12px;color:var(--text-dim)}
+
+  /* ---- footer / cta ---- */
+  .cta{text-align:center;padding:80px 0}
+  .cta h2{font-size:clamp(26px,4vw,40px);font-weight:800;margin-bottom:16px}
+  .cta p{color:var(--text-dim);font-size:14px;margin-bottom:30px}
+  .btn{
+    display:inline-block;border:1px solid var(--phosphor);color:var(--phosphor);
+    text-decoration:none;font-weight:700;padding:13px 28px;border-radius:4px;
+    letter-spacing:.04em;transition:.18s;
+  }
+  .btn:hover{background:var(--phosphor);color:#020402;box-shadow:0 0 28px rgba(0,255,65,.5)}
+  footer{border-top:1px solid var(--line);padding:28px 0;font-size:12px;color:var(--text-dim)}
+  .foot-in{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
+  footer a{color:var(--phosphor-dim);text-decoration:none}
+  footer a:hover{color:var(--phosphor)}
+
+  .cursor{display:inline-block;width:9px;height:1.05em;background:var(--phosphor);
+    vertical-align:-2px;margin-left:3px;animation:blink 1s steps(1) infinite;box-shadow:0 0 8px var(--phosphor)}
+  @keyframes blink{50%{opacity:0}}
+
+  @media (max-width:880px){
+    .hero{grid-template-columns:1fr;gap:40px;padding:48px 0}
+    .device{order:-1;max-width:380px}
+    .bar nav{display:none}
+  }
+
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important;scroll-behavior:auto}
+    #boot{display:none}
+  }
+</style>
+</head>
+<body>
+
+<div class="crt-scanlines"></div>
+<div class="crt-vignette"></div>
+<div class="crt-flicker"></div>
+
+<!-- boot sequence -->
+<div id="boot" aria-hidden="true"></div>
+
+<header class="bar">
+  <div class="wrap bar-in">
+    <div class="brand"><span class="dot"></span>CARDPUTER&nbsp;ADV<span style="color:var(--text-dim);font-weight:400">/nuttx</span></div>
+    <nav>
+      <a href="#hardware">Hardware</a>
+      <a href="#features">Features</a>
+      <a href="#apps">Apps</a>
+      <a href="#build">Build</a>
+      <a href="#controls">Controls</a>
+    </nav>
+    <a class="repo" href="https://github.com/nil-coder-sudo/M5-CardputerADV-Nuttx" target="_blank" rel="noopener">★ View on GitHub</a>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- HERO -->
+  <section class="hero" style="border-top:none">
+    <div>
+      <div class="eyebrow">Apache NuttX · ESP32-S3 · Stamp-S3A</div>
+      <h1><span class="a glow">Hacker Green</span><br><span class="b">terminal in</span><br><span class="a glow">your pocket.</span></h1>
+      <p class="lede">A NuttX firmware UI for the <b>M5 Cardputer ADV</b> with a fixed phosphor-green theme. A launcher menu and five built-in apps — all drawn with self-contained vector graphics, no image assets.</p>
+      <p class="lede">Screen tester, keyboard tester, a live <b>NSH terminal</b> with 200-line scrollback, a file manager, and a battery monitor.</p>
+      <div class="hero-meta">
+        <div>DISPLAY<span>240×135</span></div>
+        <div>KEYBOARD<span>56 keys</span></div>
+        <div>BUILT-IN APPS<span>5</span></div>
+        <div>SCROLLBACK<span>200 lines</span></div>
+      </div>
+    </div>
+
+    <!-- the signature: a simulated device screen -->
+    <div class="device">
+      <div class="bezel">
+        <div class="screen">
+          <div class="sl"></div>
+          <div class="statusbar">
+            <span id="sbTitle">LAUNCHER</span>
+            <span class="batt"><span class="cell" id="battCell" style="--lvl:87%"></span><span id="battPct">87%</span></span>
+          </div>
+          <div class="menu" id="menu">
+            <div class="row"><span class="ic">▤</span><span>ScreenTest</span></div>
+            <div class="row"><span class="ic">⌨</span><span>Keyboard</span></div>
+            <div class="row"><span class="ic">▮</span><span>Terminal</span></div>
+            <div class="row"><span class="ic">▣</span><span>Files</span></div>
+            <div class="row"><span class="ic">▰</span><span>Battery</span></div>
+          </div>
+        </div>
+      </div>
+      <p class="device-cap">1.14″ IPS · phosphor #00FF41 · 8×16 font</p>
+    </div>
+  </section>
+
+  <!-- HARDWARE -->
+  <section id="hardware">
+    <div class="sec-head"><span class="num">01</span><h2>Hardware</h2><span class="rule"></span></div>
+    <div class="hw">
+      <div class="cell-hw"><div class="k">Core module</div><div class="v">Stamp-S3A<small>ESP32-S3FN8 · dual-core Xtensa LX7 @ 240 MHz</small></div></div>
+      <div class="cell-hw"><div class="k">Display</div><div class="v">ST7789 IPS<small>1.14″ · 240×135 px · RGB565 · SPI bus 2</small></div></div>
+      <div class="cell-hw"><div class="k">Keyboard</div><div class="v">56-key matrix<small>4×14 via TCA8418 · software I²C (GPIO8/9)</small></div></div>
+      <div class="cell-hw"><div class="k">Battery</div><div class="v">1750 mAh Li-ion<small>side ON/OFF switch · /dev/adc0 ch9 ×2 divider</small></div></div>
+      <div class="cell-hw"><div class="k">RTOS</div><div class="v">Apache NuttX<small>real-time, POSIX-style embedded OS</small></div></div>
+      <div class="cell-hw"><div class="k">Font</div><div class="v">JetBrains Mono<small>8×16 embedded · 30 cols × 8 rows of text</small></div></div>
+    </div>
+    <div class="adv-note">
+      <b>Note —</b> this targets the Cardputer <b>ADV</b> on the Stamp-S3A core, not the original Cardputer. The ADV adds a larger battery, a BMI270 IMU, ES8311 audio, an IR emitter, and a microSD slot. Those peripherals are present on the board but not yet wired up by this firmware — they're free for you to use.
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section id="features">
+    <div class="sec-head"><span class="num">02</span><h2>Features</h2><span class="rule"></span></div>
+    <div class="feat">
+      <div class="f"><div class="t">Launcher menu</div><p>Five built-in apps, one-handed up/down browsing. OPT is a universal back key from anywhere.</p></div>
+      <div class="f"><div class="t">Live status bar</div><p>Current app title plus a battery gauge — percentage and colour state, refreshed roughly every 2 seconds.</p></div>
+      <div class="f"><div class="t">NSH terminal</div><p>Wired to a ring-buffer character device with 200 lines of scrollback history you can page through.</p></div>
+      <div class="f"><div class="t">VT100 handling</div><p>Cursor moves, erase line/screen, and colour SGR sequences are parsed and consumed for the shell.</p></div>
+      <div class="f"><div class="t">Fast row flushes</div><p>Printable characters flush a single dirty row for snappy typing; full repaints only on newline or scroll.</p></div>
+      <div class="f"><div class="t">Vector graphics</div><p>Rounded rects, gradients, and icons drawn in code. No external image assets to ship or load.</p></div>
+    </div>
+  </section>
+
+  <!-- APPS -->
+  <section id="apps">
+    <div class="sec-head"><span class="num">03</span><h2>Built-in apps</h2><span class="rule"></span></div>
+    <div class="apps">
+      <div class="app"><div class="hd"><span class="nm">ScreenTest</span><span class="ix">01</span></div><div class="bd">Cycles full-screen solid colours to check for dead pixels or tint. A centered card names each colour and its index.</div></div>
+      <div class="app"><div class="hd"><span class="nm">Keyboard</span><span class="ix">02</span></div><div class="bd">Live key inspector — decoded character, raw scan code, and the SH / CT / FN modifier state. Great for verifying the matrix.</div></div>
+      <div class="app"><div class="hd"><span class="nm">Terminal</span><span class="ix">03</span></div><div class="bd">Interactive NSH shell on the LCD with command history and 200-line scrollback. Bottom-anchored; output fills upward.</div></div>
+      <div class="app"><div class="hd"><span class="nm">Files</span><span class="ix">04</span></div><div class="bd">Simple browser starting at root. ENTER opens directories, <code>..</code> goes up, and a counter shows position in long listings.</div></div>
+      <div class="app"><div class="hd"><span class="nm">Battery</span><span class="ix">05</span></div><div class="bd">Large percentage gauge, raw millivolts, and a Full / OK / Low status. Degrades to a diagnostic if the ADC is unreadable.</div></div>
+    </div>
+  </section>
+
+  <!-- BUILD -->
+  <section id="build">
+    <div class="sec-head"><span class="num">04</span><h2>Build &amp; flash</h2><span class="rule"></span></div>
+    <div class="term">
+      <div class="top"><i class="r"></i><i class="y"></i><i class="g"></i><span class="ttl">~/nuttx — standard ESP32-S3 build flow</span></div>
+      <div class="body">
+<div class="cmt"># place esp32s3_bringup.c in the board source, then configure</div>
+<div class="pr"><span class="cm">cd nuttx &amp;&amp; ./tools/configure.sh esp32s3-devkit:nsh</span></div>
+<div class="pr"><span class="cm">make menuconfig</span>   <span class="cmt"># enable LCD / ST7789 / ADC / SPIFLASH</span></div>
+<div class="cmt"># build → produces nuttx.bin + bootloader + partition table</div>
+<div class="pr"><span class="cm">make -j</span></div>
+<div class="out">  CC:  esp32s3_bringup.c</div>
+<div class="out">  LD:  nuttx</div>
+<div class="out">  BIN: nuttx.bin</div>
+<div class="cmt"># flash over USB-C (side switch ON)</div>
+<div class="pr"><span class="cm">make flash ESPTOOL_PORT=/dev/ttyACM0 ESPTOOL_BAUD=921600</span></div>
+<div class="out">  Writing... done. Hash of data verified.</div>
+<div class="pr"><span class="cm">make monitor ESPTOOL_PORT=/dev/ttyACM0</span> <span class="cmt"># optional console</span></div>
+<div class="pr"><span class="cursor"></span></div>
+      </div>
+    </div>
+    <div class="adv-note" style="border-left-color:var(--phosphor-dim);background:rgba(0,255,65,.04);color:var(--text-dim)">
+      Need download mode? Hold <b style="color:var(--phosphor)">G0</b> while tapping reset. On the ESP32-S3 native USB auto-reset usually makes this unnecessary.
+    </div>
+  </section>
+
+  <!-- CONTROLS -->
+  <section id="controls">
+    <div class="sec-head"><span class="num">05</span><h2>Controls</h2><span class="rule"></span></div>
+    <p class="lede" style="max-width:60ch;margin-bottom:30px">The keyboard has an <b>fn</b> modifier for the arrow layer, plus <b>shift</b>, <b>ctrl</b>, and <b>OPT</b> as a universal back. In menus and browsers, <code>i</code>/<code>k</code> also move up/down one-handed; in the terminal, arrows always need <code>fn</code> so typing isn't intercepted.</p>
+    <div class="keys">
+      <div class="key"><span class="kcap">OPT</span><div class="act">Back to launcher, from any app</div></div>
+      <div class="key"><span class="kcap">ENTER</span><div class="act">Select / confirm</div></div>
+      <div class="key"><span class="kcap">fn + I</span><div class="act">Up</div></div>
+      <div class="key"><span class="kcap">fn + K</span><div class="act">Down</div></div>
+      <div class="key"><span class="kcap">fn + J</span><div class="act">Left</div></div>
+      <div class="key"><span class="kcap">fn + L</span><div class="act">Right</div></div>
+      <div class="key"><span class="kcap">fn + ↑</span><div class="act">Scroll back into history</div></div>
+      <div class="key"><span class="kcap">fn + ↓</span><div class="act">Scroll forward to live view</div></div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta">
+    <h2 class="glow">Clone it. Flash it. Hack it.</h2>
+    <p>Built on Apache NuttX for the M5 Cardputer ADV. Verify your pin assignments before flashing.</p>
+    <a class="btn" href="https://github.com/nil-coder-sudo/M5-CardputerADV-Nuttx" target="_blank" rel="noopener">★ nil-coder-sudo/M5-CardputerADV-Nuttx</a>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap foot-in">
+    <span>Maker: <strong style="color:var(--phosphor)">Nelson</strong> · Font: JetBrains Mono 8×16 · 100% C</span>
+    <span><a href="https://github.com/nil-coder-sudo/M5-CardputerADV-Nuttx" target="_blank" rel="noopener">github.com/nil-coder-sudo/M5-CardputerADV-Nuttx</a></span>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---- boot sequence ---- */
+  var boot = document.getElementById('boot');
+  var lines = [
+    {t:'NuttShell (NSH) — Apache NuttX',c:'muted'},
+    {t:'',c:'muted'},
+    {t:'[  0.012] esp32s3: Stamp-S3A core online @ 240 MHz',c:'muted'},
+    {t:'[  0.044] st7789: 240x135 RGB565 ... <span class="ok">OK</span>',c:'muted'},
+    {t:'[  0.061] tca8418: 56-key matrix on swI2C ... <span class="ok">OK</span>',c:'muted'},
+    {t:'[  0.088] adc0: battery channel ... <span class="ok">OK</span>',c:'muted'},
+    {t:'[  0.103] gfx_init: phosphor #00FF41 theme ... <span class="ok">OK</span>',c:'muted'},
+    {t:'[  0.140] launching lcd_cons + kbd_nsh threads',c:'muted'},
+    {t:'',c:'muted'},
+    {t:'<span class="ok">> launcher ready.</span>',c:'ok'}
+  ];
+
+  function finish(){ document.body.classList.add('booted'); }
+
+  if(reduce){ finish(); }
+  else{
+    var i=0;
+    (function step(){
+      if(i>=lines.length){ setTimeout(finish, 520); return; }
+      var d=document.createElement('div');
+      d.className='line '+lines[i].c;
+      d.innerHTML=lines[i].t;
+      boot.appendChild(d);
+      requestAnimationFrame(function(){ d.classList.add('show'); });
+      i++;
+      setTimeout(step, i<3?160:Math.random()*120+90);
+    })();
+  }
+
+  /* ---- animated menu selection + battery on the device ---- */
+  var rows = document.querySelectorAll('#menu .row');
+  var titles = ['SCREENTEST','KEYBOARD','TERMINAL','FILES','BATTERY'];
+  var sbTitle = document.getElementById('sbTitle');
+  var sel = 0;
+  function paint(){
+    rows.forEach(function(r,idx){ r.classList.toggle('sel', idx===sel); });
+  }
+  paint();
+  if(!reduce){
+    setInterval(function(){
+      sel=(sel+1)%rows.length;
+      paint();
+      // status bar follows the highlighted app, mimicking entering it
+      sbTitle.textContent = Math.random()<0.5 ? 'LAUNCHER' : titles[sel];
+    }, 1900);
+
+    // slow battery drift, like the ~2s gauge refresh
+    var pct=87, cell=document.getElementById('battCell'), label=document.getElementById('battPct');
+    setInterval(function(){
+      pct -= 1; if(pct<14) pct=92;
+      cell.style.setProperty('--lvl', pct+'%');
+      label.textContent = pct+'%';
+    }, 2400);
+  }
+})();
+</script>
+</body>
+</html>
