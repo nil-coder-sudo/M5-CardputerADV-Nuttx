@@ -3,7 +3,9 @@
 A NuttX firmware UI for the **M5 Cardputer ADV (ESP32‑S3)** with a fixed
 phosphor‑green theme (`#00FF41`). It provides a small launcher menu and a set
 of built‑in apps: a screen tester, a keyboard tester, an interactive NSH
-terminal with scrollback, a file manager, and a battery monitor.
+terminal with scrollback, a file manager, a battery monitor, and a Wi‑Fi
+manager (scan / join / DHCP). The UI runs without a full framebuffer, so the
+whole firmware leaves ~70 KB more heap for Wi‑Fi than earlier versions.
 
 > **Board:** this firmware targets the **Cardputer ADV** (the "Advance"
 > version), built on the **Stamp‑S3A** core module (ESP32‑S3FN8) — not the
@@ -53,15 +55,19 @@ content.
 
 ## Features
 
-- **Launcher menu** with five built‑in apps.
+- **Launcher menu** with six built‑in apps.
+- **Wi‑Fi app** — scan, pick a network, type the passphrase on the
+  keyboard, join, and get a DHCP lease. Status card shows SSID, IP and RSSI.
+- **Low‑RAM banded renderer** — screens are drawn 16 pixel rows at a time
+  into a 7.6 KB buffer instead of a 64.8 KB framebuffer.
 - **Live status bar** showing the current app title and a battery gauge
   (percentage + colour state), refreshed roughly every 2 seconds.
 - **NSH terminal** wired to a ring‑buffer character device, with a
   **200‑line scrollback** history you can page through.
 - **VT100 handling** for the shell (cursor moves, erase line/screen, color SGR
   sequences are consumed).
-- **Fast single‑row screen flushes** on the hot path for snappy typing, with
-  full‑band repaints only on newline/scroll.
+- **One SPI transfer per 16‑row band**: a typed character costs one
+  transfer, a newline eight.
 - **Self‑contained vector graphics** (rounded rects, gradients, icons) — no
   external image assets.
 
@@ -88,7 +94,8 @@ nuttx/boards/xtensa/esp32s3/esp32s3-devkit/src/esp32s3_bringup.c
 ```
 
 Make sure your build is configured so that `CONFIG_LCD`, the ST7789 driver,
-the ADC, and SPIFLASH (if used) are enabled. The bring‑up code registers two
+the ADC, and SPIFLASH (if used) are enabled. For Wi‑Fi the bring‑up calls
+`board_wlan_init()` whenever `CONFIG_ESPRESSIF_WIFI` is set. The bring‑up code registers two
 character devices — `/dev/cardputer_kbd` and `/dev/cardputer_out` — and
 launches the `lcd_cons` and `kbd_nsh` kernel threads.
 
@@ -97,8 +104,18 @@ launches the `lcd_cons` and `kbd_nsh` kernel threads.
 ```bash
 cd nuttx
 ./tools/configure.sh esp32s3-devkit:nsh
-make menuconfig   # enable LCD / ST7789 / ADC / SPIFLASH as needed
+cp ../M5-CardputerADV-Nuttx/.config .config   # the tuned config from this repo
+make olddefconfig                              # let Kconfig fill in defaults
 ```
+
+The repo's `.config` is already tuned for Wi‑Fi on a no‑PSRAM board. If you
+keep your own config, apply the same changes with:
+
+```bash
+python3 ../M5-CardputerADV-Nuttx/tune_config.py .config && make olddefconfig
+```
+
+See the comments in `tune_config.py` for what each setting does.
 
 ### 4. Build
 
@@ -218,6 +235,46 @@ soon). The view auto‑refreshes about once per second.
   the `errno` and sample info instead of crashing.
 - **OPT** — back to menu
 
+### 6. Wi‑Fi
+
+The top card shows the current link (SSID, IP address, RSSI and a signal
+icon); it refreshes every 3 seconds. Below it is the scan list — up to 8
+networks, strongest first, duplicates and hidden SSIDs removed.
+
+| Key | Action |
+|-----|--------|
+| **s** | Scan for networks (takes a couple of seconds) |
+| **r** | Refresh link status |
+| **UP / DOWN** | Select a network (`i`/`;` and `k`/`.` work without `fn`) |
+| **ENTER** | Open the passphrase prompt for the selected network |
+
+In the passphrase prompt:
+
+| Key | Action |
+|-----|--------|
+| any printable key | Type (8–63 characters; leave empty for an open network) |
+| **TAB** | Show / hide the passphrase |
+| **BACKSPACE** | Delete |
+| **ENTER** | Connect |
+| `fn` + `j` | Back to the list |
+
+On success the firmware switches to the **Terminal** and runs
+`renew wlan0`, so you can watch the DHCP lease arrive. The passphrase is
+handed straight to the driver with ioctls — it never goes through the shell
+and is wiped from memory afterwards. The app's state (~430 B) only exists
+on the heap while the app is open.
+
+You can also manage Wi‑Fi from the terminal with the stock tools:
+
+```
+wapi scan wlan0
+wapi psk wlan0 <passphrase> 3
+wapi essid wlan0 <ssid> 1
+renew wlan0
+ifconfig
+ping 8.8.8.8
+```
+
 ---
 
 ## Using the Terminal
@@ -266,21 +323,48 @@ is full, after which it scrolls. This is intentional, not a glitch.
 | Battery shows **N/A** / FAILED | `/dev/adc0` is missing or ADC isn't enabled — enable the ESP32‑S3 ADC and re‑flash. |
 | Typing feels laggy / repeats | A ~100 ms per‑key cooldown debounces the matrix; this is expected, not a fault. |
 | Flash fails to connect | Hold **G0** during reset to force download mode, lower the baud rate, or try a different USB cable/port. |
+| Wi‑Fi app says `wlan0 is down` / no device | `CONFIG_ESPRESSIF_WIFI` is off, or `board_wlan_init` failed — check the serial log. |
+| `join failed (-110)` | Timed out: wrong passphrase or AP out of range. Raise `CONFIG_ESPRESSIF_WIFI_CONNECT_TIMEOUT` for slow APs. |
+| Joined but no IP | Check the `renew wlan0` output in the terminal; run it again if the AP was slow. |
+| Garbage on screen after the update | The SPI clock is now 40 MHz. Set `CONFIG_LCD_ST7789_FREQUENCY=20000000` and rebuild. |
+| Random crashes after shrinking stacks | Run `ps` (stack coloration is on) and raise `CARDPUTER_LCDCONS_STACK` / `CARDPUTER_KBD_STACK` at the top of `esp32s3_bringup.c`. |
 
 ---
 
 ## Technical Notes
 
-- **Framebuffer:** 240 × 135 × 2 = 64,800 bytes (full RGB565 frame held in RAM).
-- **Scrollback store:** 200 × 30 × 3 = 18,000 bytes of char + colour history.
+- **Banded renderer:** no framebuffer. Every screen is a *compose*
+  callback; `gfx_render()` runs it once per 16‑row band into a
+  240 × 16 × 2 = 7,680‑byte buffer and pushes each band with one `putarea()`.
+  Drawing primitives clip to the current band, so app code just draws the
+  whole screen.
+- **Scrollback store:** 200 × 30 = 6,000 bytes (characters only — the old
+  colour plane always held the same colour).
+- **File manager:** re‑reads the directory and keeps only the 6 visible
+  names, instead of caching 64 entries.
+- **RAM, measured on the linked firmware** (NuttX master, Wi‑Fi on):
+
+  | | old UI | this version |
+  |---|---:|---:|
+  | UI static RAM (`.bss`/`.data`) | 88.8 KB | 16.6 KB |
+  | Whole‑image DRAM used | 184.3 KB | 117.5 KB |
+  | Wi‑Fi static RX buffers (heap) | 16 KB | 6.4 KB |
+  | UI thread stacks (heap) | 8 KB | 6.5 KB |
+
+  Net: roughly **78 KB more free heap** with Wi‑Fi running. The tuned
+  config deliberately *adds* ~8 KB of IOBs so full 1500‑byte Wi‑Fi frames
+  can be received at all (the old 8 × 196 B pool could not hold one).
 - **Display flush discipline:**
-  - Printable characters flush only the single dirty text row (fast path).
-  - Newlines repaint the whole terminal band (all 7 rows) because the view is
+  - Printable characters flush only the live text row (one band).
+  - Newlines repaint the terminal area (8 bands) because the view is
     bottom‑anchored — every newline shifts every visible row up by one.
-  - Full‑screen presents are reserved for menus, app screens, and scrollback
+  - Full‑screen renders are reserved for menus, app screens, and scrollback
     repaints.
-- **Threads:** `lcd_cons` (VT100 parser → scrollback renderer) and `kbd_nsh`
-  (keyboard scan → shell input / UI dispatch).
+- **No busy‑waiting:** the keyboard thread sleeps between 20 ms polls, and
+  the soft‑I²C no longer disables interrupts (which starved the Wi‑Fi MAC).
+- **Threads:** `lcd_cons` (VT100 parser → scrollback renderer, 3 KB stack)
+  and `kbd_nsh` (keyboard scan → shell input / UI dispatch, Wi‑Fi ioctls,
+  3.5 KB stack).
 - **Devices:** `/dev/cardputer_kbd` (shell I/O) and `/dev/cardputer_out`
   (display output ring). Syslog is mirrored to the screen when enabled.
 

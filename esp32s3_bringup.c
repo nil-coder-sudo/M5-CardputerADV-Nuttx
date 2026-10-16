@@ -1,55 +1,57 @@
 /****************************************************************************
  * boards/xtensa/esp32s3/esp32s3-devkit/src/esp32s3_bringup.c
  *
- * M5 Cardputer — Hacker Green UI
+ * M5 Cardputer ADV — Hacker Green UI   (low-RAM + Wi-Fi edition)
  *
  *   Fixed phosphor-green theme (#00FF41).
  *
- *   Performance model
- *   -----------------
- *   Normal terminal output (con_putc):
- *     • Mutates the scrollback store.
- *     • Flushes only the single dirty row via gfx_flush_band()  ← fast path
- *     • gfx_present() (full-screen SPI) is NEVER called on the hot path.
+ *   RAM model  (what changed vs. the first version)
+ *   ---------
+ *   • No full framebuffer any more.  Every screen is a "compose" callback
+ *     that draws into a 240 x 16 px BAND buffer (7,680 B).  gfx_render()
+ *     runs the callback once per band and pushes each band to the ST7789
+ *     with ONE putarea() SPI transfer.  The old 64,800 B g_fb is gone.
+ *   • Scrollback stores characters only.  The old colour plane
+ *     (200 x 30 x 2 = 12,000 B) always held COL_FG, so it was dropped.
+ *   • File manager no longer caches 64 directory entries (≈2.7 KB); it
+ *     re-reads the directory and keeps only the 6 visible names.
+ *   • The Wi-Fi app's state (scan list, password) lives on the heap only
+ *     while the app is open and is wiped + freed when you leave it.
+ *   • Battery ADC is read once per tick into a cache instead of on every
+ *     status-bar draw.
  *
- *   Scroll repaint (term_repaint_locked):
- *     • Redraws all TERM_ROWS into the framebuffer then calls gfx_present().
- *     • Only triggered by fn+UP / fn+DOWN keypresses.
+ *   Static .bss (approx.)          before      after
+ *     framebuffer / band          64,800      7,680
+ *     SPI byte-swap line buffer      480          0
+ *     scrollback chars             6,000      6,000
+ *     scrollback colours          12,000          0
+ *     file-manager cache           2,752       ~300
+ *     ring buffers                 1,024        768
+ *     kthread stacks (heap)        8,192      6,656
+ *                                ~95 KB     ~21 KB
  *
- *   Newline / scroll-up (sb_scroll_screen_locked):
- *     • Blits TERM_ROWS rows then calls gfx_flush_band(terminal area).
- *     • Does NOT call gfx_present().
+ *   CPU / Wi-Fi friendliness
+ *   ------------------------
+ *   • Keyboard thread sleeps (usleep) instead of busy-waiting (up_mdelay).
+ *   • Soft-I2C no longer disables interrupts for a whole transaction;
+ *     I2C tolerates a stretched SCL, Wi-Fi does not tolerate IRQ-off time.
+ *   • A newline now costs 8 SPI transfers instead of 119.
  *
  *   Key routing
  *   -----------
- *   UI_MODE_MENU
- *     UP / DOWN          → menu navigation  (NO fn required)
- *     fn + UP/DOWN       → same (fn is irrelevant in menu)
- *
- *   UI_MODE_TERMINAL
- *     fn + UP            → scroll back  (term_scroll_up)
- *     fn + DOWN          → scroll forward (term_scroll_down)
- *     UP/DOWN/LEFT/RIGHT → VT100 cursor escape sent to shell
- *     any other key      → snap to live, then route to shell
- *
- *   Scrollback
- *   ----------
- *   SCROLLBACK_LINES ring-buffer of char+colour rows.
- *   g_scroll_offset == 0  →  live view (normal).
- *   g_scroll_offset >  0  →  scrolled back; status bar shows "↑N".
- *   Any non-scroll key in terminal snaps back to live view first.
- *
- *   RAM: 240×135×2 = 64,800 B framebuffer +
- *        SCROLLBACK_LINES × COLS × 3 B history (200 × 30 × 3 = 18,000 B).
+ *   MENU / ScreenTest / Files / Wi-Fi list : i ; = UP, k . = DOWN (no fn)
+ *   TERMINAL : fn+UP / fn+DOWN scroll back, other arrows → VT100 to shell
+ *   OPT      : back to menu from anywhere
  ****************************************************************************/
 
 #include <nuttx/config.h>
 #include <nuttx/arch.h>
+#include <nuttx/clock.h>
 #include <nuttx/kthread.h>
+#include <nuttx/kmalloc.h>
 #include <nuttx/fs/fs.h>
 #include <nuttx/semaphore.h>
 #include <nuttx/mutex.h>
-#include <nuttx/irq.h>
 #include <nuttx/spi/spi.h>
 #include <nuttx/lcd/lcd.h>
 #include <nuttx/lcd/lcd_dev.h>
@@ -65,20 +67,21 @@
 #include "espressif/esp_gpio.h"
 #include "esp32s3_start.h"
 
-#ifdef CONFIG_ESP32S3_TIMER
-#  include "esp32s3_board_tim.h"
-#endif
-
 #if defined(CONFIG_ESPRESSIF_ADC) || defined(CONFIG_ESP32S3_ADC)
 #  include "esp32s3_board_adc.h"
 #endif
 
+#ifdef CONFIG_ESPRESSIF_WIFI
+#  include "esp32s3_board_wlan.h"
+#endif
+
 #include <fcntl.h>
 #include <unistd.h>
-#include <sched.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 #include <errno.h>
 #include <syslog.h>
@@ -87,6 +90,40 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <poll.h>
+
+/* Wi-Fi UI is built only when the network stack and the wireless ioctls
+ * are available.  Everything else works without it.
+ */
+
+#if defined(CONFIG_NET) && defined(CONFIG_NETDEV_WIRELESS_IOCTL) && \
+    (defined(CONFIG_ESPRESSIF_WIFI) || defined(CONFIG_ESP32S3_WIFI))
+#  define CARDPUTER_WIFI 1
+#  include <sys/socket.h>
+#  include <net/if.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+#  include <nuttx/net/net.h>
+#  include <nuttx/wireless/wireless.h>
+#endif
+
+/****************************************************************************
+ * Tunables  (override with -D or edit here)
+ ****************************************************************************/
+
+#ifndef CARDPUTER_SCROLLBACK_LINES
+#  define CARDPUTER_SCROLLBACK_LINES 200      /* 30 B per line           */
+#endif
+
+#ifndef CARDPUTER_LCDCONS_STACK
+#  define CARDPUTER_LCDCONS_STACK    3072     /* was 4096                */
+#endif
+
+#ifndef CARDPUTER_KBD_STACK
+#  define CARDPUTER_KBD_STACK        3584     /* was 4096; Wi-Fi scan    */
+#endif
+
+#define KBD_RING_SIZE   256    /* keys + injected Wi-Fi commands          */
+#define OUT_RING_SIZE   512    /* shell output burst buffer               */
 
 /****************************************************************************
  * External LCD driver symbols
@@ -136,15 +173,12 @@ int board_spiflash_init(void);
 #define BOT_ROW   (ROWS - 1)
 #define TERM_ROWS (ROWS - TOP_ROW)        /* 7 visible terminal rows */
 
-/* Pixel bands */
 #define TERM_Y0   (TOP_ROW * FONT_H)
 #define TERM_Y1   (LCD_H - 1)
 
 /****************************************************************************
  * Colour palette — fixed hacker green
  ****************************************************************************/
-
-#define COL_PROMPT   COL_ACCENT
 
 #define COL_ACCENT   0x07E8u
 #define COL_MARKER   0x4FEAu
@@ -170,7 +204,7 @@ int board_spiflash_init(void);
 #define RGB_BLACK    0x0000u
 
 /****************************************************************************
- * Embedded font (JetBrains Mono 8×16)
+ * Embedded font (JetBrains Mono 8×16) — const, lives in flash (DROM)
  ****************************************************************************/
 
 #define GFX_FONT_FIRST 32
@@ -277,13 +311,29 @@ static const uint8_t g_font8x16[(126-32+1)*16] =
 };
 
 /****************************************************************************
- * Graphics library — RGB565 framebuffer
+ * Graphics library — banded RGB565 renderer
+ *
+ *   g_band holds BAND_H pixel rows [g_by0 .. g_by1] of the screen.
+ *   Every primitive clips against that window, so a compose callback can
+ *   draw the WHOLE screen and only the part inside the band lands in RAM.
+ *   Outside gfx_render() the window is empty and all drawing is a no-op.
  ****************************************************************************/
+
+#define BAND_H       16
+#define BAND_PIXELS  (LCD_W * BAND_H)
+
+#ifndef GFX_SWAP_BYTES
+#  define GFX_SWAP_BYTES 1
+#endif
+
+typedef void (*compose_t)(void);
 
 static struct lcd_dev_s        *g_lcddev = NULL;
 static struct lcd_planeinfo_s   g_pinfo;
 static bool                     g_gfx_ready = false;
-static uint16_t                 g_fb[LCD_W * LCD_H];
+static uint16_t                 g_band[BAND_PIXELS] aligned_data(4);
+static int                      g_by0 = 0;     /* band top    (inclusive) */
+static int                      g_by1 = -1;    /* band bottom (inclusive) */
 static mutex_t                  g_con_mutex = NXMUTEX_INITIALIZER;
 
 static int gfx_init(void)
@@ -295,89 +345,128 @@ static int gfx_init(void)
   return g_gfx_ready ? OK : -ENOSYS;
 }
 
-#ifndef GFX_SWAP_BYTES
-#  define GFX_SWAP_BYTES 1
+static inline FAR uint16_t *gfx_rowp(int y)
+{
+  return &g_band[(y - g_by0) * LCD_W];
+}
+
+/* Clip a [*ya, *yb] row range to the current band. */
+
+static inline bool gfx_clip_y(FAR int *ya, FAR int *yb)
+{
+  if (*ya < g_by0) *ya = g_by0;
+  if (*yb > g_by1) *yb = g_by1;
+  return *ya <= *yb;
+}
+
+static inline bool gfx_band_hits(int y, int h)
+{
+  return (y <= g_by1) && (y + h - 1 >= g_by0);
+}
+
+/* Push band rows [y0 .. y0+h-1] to the panel.  Bytes are swapped in place:
+ * the band is recomposed from scratch before the next flush anyway.
+ */
+
+static void gfx_band_flush(int y0, int h)
+{
+  FAR struct lcd_dev_s *dev = g_pinfo.dev ? g_pinfo.dev : g_lcddev;
+  int n = h * LCD_W;
+
+#if GFX_SWAP_BYTES
+  for (int i = 0; i < n; i++)
+    {
+      uint16_t v = g_band[i];
+      g_band[i] = (uint16_t)((v >> 8) | (v << 8));
+    }
+#else
+  UNUSED(n);
 #endif
 
-static uint16_t g_linebuf[LCD_W];
+  if (g_pinfo.putarea != NULL)
+    {
+      /* stride == row size → the ST7789 driver does ONE SPI transfer */
 
-/* Flush pixel rows [y0..y1] inclusive to LCD over SPI.
-   This is the ONLY path that writes to the physical display. */
-static void gfx_flush_band(int y0, int y1)
+      g_pinfo.putarea(dev, y0, y0 + h - 1, 0, LCD_W - 1,
+                      (FAR const uint8_t *)g_band, LCD_W * 2);
+    }
+  else
+    {
+      for (int r = 0; r < h; r++)
+        g_pinfo.putrun(dev, y0 + r, 0,
+                       (FAR const uint8_t *)&g_band[r * LCD_W], LCD_W);
+    }
+}
+
+/* Draw screen rows [y0..y1] with `fn` and send them to the LCD.
+ * Caller must hold g_con_mutex (the band buffer is shared).
+ */
+
+static void gfx_render(compose_t fn, int y0, int y1)
 {
   if (!g_gfx_ready) return;
   if (y0 < 0) y0 = 0;
   if (y1 > LCD_H - 1) y1 = LCD_H - 1;
-  if (y1 < y0) return;
 
-  FAR struct lcd_dev_s *dev = g_pinfo.dev ? g_pinfo.dev : g_lcddev;
-  for (int row = y0; row <= y1; row++)
+  for (int y = y0; y <= y1; y += BAND_H)
     {
-      FAR const uint16_t *src = &g_fb[row * LCD_W];
-#if GFX_SWAP_BYTES
-      for (int x = 0; x < LCD_W; x++)
-        {
-          uint16_t v = src[x];
-          g_linebuf[x] = (uint16_t)((v >> 8) | (v << 8));
-        }
-      FAR const uint8_t *p = (FAR const uint8_t *)g_linebuf;
-#else
-      FAR const uint8_t *p = (FAR const uint8_t *)src;
-#endif
-      if (g_pinfo.putarea != NULL)
-        g_pinfo.putarea(dev, row, row, 0, LCD_W - 1, p, LCD_W * 2);
-      else
-        g_pinfo.putrun(dev, row, 0, p, LCD_W);
+      int h = y1 - y + 1;
+      if (h > BAND_H) h = BAND_H;
+
+      g_by0 = y;
+      g_by1 = y + h - 1;
+
+      for (int i = 0; i < h * LCD_W; i++) g_band[i] = COL_BG;
+      fn();
+      gfx_band_flush(y, h);
     }
+
+  g_by0 = 0;
+  g_by1 = -1;          /* stray draws outside a render become no-ops */
 }
 
-/* Full-screen flush (menu, splash, scroll repaint) */
-static inline void gfx_present(void) { gfx_flush_band(0, LCD_H - 1); }
-
-/* Flush one terminal text row (16 pixel lines) */
-static inline void gfx_flush_row(int text_row)
+static inline void gfx_render_all(compose_t fn)
 {
-  int y = text_row * FONT_H;
-  gfx_flush_band(y, y + FONT_H - 1);
+  gfx_render(fn, 0, LCD_H - 1);
 }
+
+static void compose_nothing(void) { }
 
 static inline void gfx_px(int x, int y, uint16_t c)
 {
-  if ((unsigned)x < LCD_W && (unsigned)y < LCD_H) g_fb[y * LCD_W + x] = c;
+  if ((unsigned)x < LCD_W && y >= g_by0 && y <= g_by1)
+    gfx_rowp(y)[x] = c;
 }
 
 static void gfx_hline(int x, int y, int w, uint16_t c)
 {
-  if (y < 0 || y >= LCD_H || w <= 0) return;
+  if (y < g_by0 || y > g_by1 || w <= 0) return;
   if (x < 0) { w += x; x = 0; }
   if (x + w > LCD_W) w = LCD_W - x;
   if (w <= 0) return;
-  uint16_t *p = &g_fb[y * LCD_W + x];
+  FAR uint16_t *p = gfx_rowp(y) + x;
   while (w-- > 0) *p++ = c;
 }
 
 static void gfx_vline(int x, int y, int h, uint16_t c)
 {
-  if (x < 0 || x >= LCD_W || h <= 0) return;
-  if (y < 0) { h += y; y = 0; }
-  if (y + h > LCD_H) h = LCD_H - y;
-  for (int i = 0; i < h; i++) g_fb[(y + i) * LCD_W + x] = c;
+  if ((unsigned)x >= LCD_W || h <= 0) return;
+  int ya = y, yb = y + h - 1;
+  if (!gfx_clip_y(&ya, &yb)) return;
+  for (int yy = ya; yy <= yb; yy++) gfx_rowp(yy)[x] = c;
 }
 
 static void gfx_fill_rect(int x, int y, int w, int h, uint16_t c)
 {
-  for (int j = 0; j < h; j++) gfx_hline(x, y + j, w, c);
-}
-
-static void gfx_rect(int x, int y, int w, int h, uint16_t c)
-{
-  gfx_hline(x, y, w, c); gfx_hline(x, y + h - 1, w, c);
-  gfx_vline(x, y, h, c); gfx_vline(x + w - 1, y, h, c);
+  int ya = y, yb = y + h - 1;
+  if (!gfx_clip_y(&ya, &yb)) return;
+  for (int yy = ya; yy <= yb; yy++) gfx_hline(x, yy, w, c);
 }
 
 static void gfx_clear(uint16_t c)
 {
-  for (int i = 0; i < LCD_W * LCD_H; i++) g_fb[i] = c;
+  int n = (g_by1 - g_by0 + 1) * LCD_W;
+  for (int i = 0; i < n; i++) g_band[i] = c;
 }
 
 static void gfx_line(int x0, int y0, int x1, int y1, uint16_t c)
@@ -403,26 +492,40 @@ static int isqrt32(int v)
   return x;
 }
 
+/* Row index range of a shape [y, y+h) that falls inside the band. */
+
+static inline bool gfx_rows(int y, int h, FAR int *j0, FAR int *j1)
+{
+  *j0 = g_by0 - y; if (*j0 < 0) *j0 = 0;
+  *j1 = g_by1 - y; if (*j1 > h - 1) *j1 = h - 1;
+  return *j0 <= *j1;
+}
+
+static inline int gfx_round_inset(int j, int h, int r)
+{
+  int dy = -1;
+  if (j < r)           dy = r - j;
+  else if (j >= h - r) dy = r - (h - 1 - j);
+  return (dy >= 0) ? r - isqrt32(r * r - dy * dy) : 0;
+}
+
 static void gfx_fill_round(int x, int y, int w, int h, int r, uint16_t c)
 {
-  if (w <= 0 || h <= 0) return;
+  int j0, j1;
+  if (w <= 0 || h <= 0 || !gfx_rows(y, h, &j0, &j1)) return;
   if (r < 0) r = 0;
   if (r > w / 2) r = w / 2;
   if (r > h / 2) r = h / 2;
-  for (int j = 0; j < h; j++)
+  for (int j = j0; j <= j1; j++)
     {
-      int dy = -1;
-      if (j < r)           dy = r - j;
-      else if (j >= h - r) dy = r - (h - 1 - j);
-      int inset = 0;
-      if (dy >= 0) inset = r - isqrt32(r * r - dy * dy);
+      int inset = gfx_round_inset(j, h, r);
       gfx_hline(x + inset, y + j, w - 2 * inset, c);
     }
 }
 
 static void gfx_round(int x, int y, int w, int h, int r, uint16_t c)
 {
-  if (w <= 0 || h <= 0) return;
+  if (w <= 0 || h <= 0 || !gfx_band_hits(y, h)) return;
   if (r < 0) r = 0;
   if (r > w / 2) r = w / 2;
   if (r > h / 2) r = h / 2;
@@ -445,7 +548,10 @@ static void gfx_round(int x, int y, int w, int h, int r, uint16_t c)
 
 static void gfx_fill_circle(int cx, int cy, int r, uint16_t c)
 {
-  for (int dy = -r; dy <= r; dy++)
+  int d0 = -r, d1 = r;
+  if (cy + d0 < g_by0) d0 = g_by0 - cy;
+  if (cy + d1 > g_by1) d1 = g_by1 - cy;
+  for (int dy = d0; dy <= d1; dy++)
     {
       int half = isqrt32(r * r - dy * dy);
       gfx_hline(cx - half, cy + dy, 2 * half + 1, c);
@@ -462,8 +568,9 @@ static inline uint16_t gfx_blend565(uint16_t a, uint16_t b, int t)
 
 static void gfx_vgrad(int x, int y, int w, int h, uint16_t c0, uint16_t c1)
 {
-  if (h <= 0) return;
-  for (int j = 0; j < h; j++)
+  int j0, j1;
+  if (h <= 0 || !gfx_rows(y, h, &j0, &j1)) return;
+  for (int j = j0; j <= j1; j++)
     {
       int t = (h > 1) ? (j * 32 / (h - 1)) : 0;
       gfx_hline(x, y + j, w, gfx_blend565(c0, c1, t));
@@ -473,17 +580,14 @@ static void gfx_vgrad(int x, int y, int w, int h, uint16_t c0, uint16_t c1)
 static void gfx_fill_round_grad(int x, int y, int w, int h, int r,
                                 uint16_t c0, uint16_t c1)
 {
-  if (w <= 0 || h <= 0) return;
+  int j0, j1;
+  if (w <= 0 || h <= 0 || !gfx_rows(y, h, &j0, &j1)) return;
   if (r < 0) r = 0;
   if (r > w / 2) r = w / 2;
   if (r > h / 2) r = h / 2;
-  for (int j = 0; j < h; j++)
+  for (int j = j0; j <= j1; j++)
     {
-      int dy = -1;
-      if (j < r)           dy = r - j;
-      else if (j >= h - r) dy = r - (h - 1 - j);
-      int inset = 0;
-      if (dy >= 0) inset = r - isqrt32(r * r - dy * dy);
+      int inset = gfx_round_inset(j, h, r);
       int t = (h > 1) ? (j * 32 / (h - 1)) : 0;
       gfx_hline(x+inset, y+j, w-2*inset, gfx_blend565(c0, c1, t));
     }
@@ -492,15 +596,15 @@ static void gfx_fill_round_grad(int x, int y, int w, int h, int r,
 static void gfx_glyph(int x, int y, char ch, uint16_t fg)
 {
   unsigned char u = (unsigned char)ch;
+  int j0, j1;
   if (u < GFX_FONT_FIRST || u > GFX_FONT_LAST) return;
-  const uint8_t *g = &g_font8x16[(u - GFX_FONT_FIRST) * GFX_FONT_H];
-  for (int row = 0; row < GFX_FONT_H; row++)
+  if (!gfx_rows(y, GFX_FONT_H, &j0, &j1)) return;
+  FAR const uint8_t *g = &g_font8x16[(u - GFX_FONT_FIRST) * GFX_FONT_H];
+  for (int row = j0; row <= j1; row++)
     {
       uint8_t bits = g[row];
       if (!bits) continue;
-      int py = y + row;
-      if ((unsigned)py >= LCD_H) continue;
-      uint16_t *line = &g_fb[py * LCD_W];
+      FAR uint16_t *line = gfx_rowp(y + row);
       for (int col = 0; col < GFX_FONT_W; col++)
         if (bits & (0x80 >> col))
           {
@@ -510,17 +614,18 @@ static void gfx_glyph(int x, int y, char ch, uint16_t fg)
     }
 }
 
-static void gtext(int x, int y, const char *s, uint16_t fg)
+static void gtext(int x, int y, FAR const char *s, uint16_t fg)
 {
-  for (; *s; s++) { gfx_glyph(x, y, *s, fg); x += GFX_FONT_W; }
+  if (!gfx_band_hits(y, GFX_FONT_H)) return;      /* cheap reject */
+  for (; *s && x < LCD_W; s++) { gfx_glyph(x, y, *s, fg); x += GFX_FONT_W; }
 }
 
-static void gtext_center(int cx, int y, const char *s, uint16_t fg)
+static void gtext_center(int cx, int y, FAR const char *s, uint16_t fg)
 {
   gtext(cx - (int)strlen(s) * GFX_FONT_W / 2, y, s, fg);
 }
 
-static void gtext_right(int rx, int y, const char *s, uint16_t fg)
+static void gtext_right(int rx, int y, FAR const char *s, uint16_t fg)
 {
   gtext(rx - (int)strlen(s) * GFX_FONT_W, y, s, fg);
 }
@@ -560,65 +665,106 @@ static void icon_battery(int x, int y, uint16_t a)
   gfx_fill_rect(x+2, y+5, 6, 4, a);
 }
 
+/* Wi-Fi fan: a dot plus `bars` arcs (0..3) opening upward. */
+
+static void gfx_wifi_glyph(int cx, int cy, int bars, uint16_t on,
+                           uint16_t off)
+{
+  gfx_fill_circle(cx, cy, 1, on);
+  for (int i = 1; i <= 3; i++)
+    {
+      int r = 1 + i * 3;
+      uint16_t c = (i <= bars) ? on : off;
+      for (int dx = -r; dx <= r; dx++)
+        {
+          if (dx * dx * 2 > r * r) continue;          /* ±45° fan */
+          int dy = isqrt32(r * r - dx * dx);
+          gfx_px(cx + dx, cy - dy, c);
+          gfx_px(cx + dx, cy - dy + 1, c);
+        }
+    }
+}
+
+#ifdef CARDPUTER_WIFI
+static void icon_wifi(int x, int y, uint16_t a)
+{
+  gfx_wifi_glyph(x + 7, y + 12, 3, a, a);
+}
+#endif
+
 /****************************************************************************
  * Ring-buffer character device
  ****************************************************************************/
 
-#define RINGBUF_SIZE 512
-
 struct ringdev_s
 {
-  char          buf[RINGBUF_SIZE];
-  volatile int  head;
-  volatile int  tail;
-  sem_t         data_sem;
-  sem_t         space_sem;
+  FAR char      *buf;
+  uint16_t       size;
+  volatile int   head;
+  volatile int   tail;
+  sem_t          data_sem;
+  sem_t          space_sem;
   FAR struct pollfd *fds_pollin;
 };
 
+static char             g_kbd_buf[KBD_RING_SIZE];
+static char             g_out_buf[OUT_RING_SIZE];
 static struct ringdev_s g_kbd_ring;
 static struct ringdev_s g_out_ring;
 static volatile bool    g_out_ring_ready = false;
 
-static void ringdev_init(FAR struct ringdev_s *r)
+static void ringdev_init(FAR struct ringdev_s *r, FAR char *buf,
+                         uint16_t size)
 {
-  memset(r->buf, 0, sizeof(r->buf));
+  r->buf = buf; r->size = size;
   r->head = 0; r->tail = 0; r->fds_pollin = NULL;
   nxsem_init(&r->data_sem,  0, 0);
-  nxsem_init(&r->space_sem, 0, RINGBUF_SIZE);
+  nxsem_init(&r->space_sem, 0, size);
+}
+
+static inline void ringdev_store(FAR struct ringdev_s *r, char c)
+{
+  r->buf[r->head] = c;
+  r->head = (r->head + 1) % r->size;
+  nxsem_post(&r->data_sem);
+  if (r->fds_pollin != NULL) poll_notify(&r->fds_pollin, 1, POLLIN);
+}
+
+static inline char ringdev_take(FAR struct ringdev_s *r)
+{
+  char c = r->buf[r->tail];
+  r->tail = (r->tail + 1) % r->size;
+  nxsem_post(&r->space_sem);
+  return c;
 }
 
 static void ringdev_putc(FAR struct ringdev_s *r, char c)
 {
   int ret;
   do { ret = nxsem_wait(&r->space_sem); } while (ret == -EINTR);
-  r->buf[r->head] = c;
-  r->head = (r->head + 1) % RINGBUF_SIZE;
-  nxsem_post(&r->data_sem);
-  if (r->fds_pollin != NULL) poll_notify(&r->fds_pollin, 1, POLLIN);
+  ringdev_store(r, c);
 }
 
 static void ringdev_tryputc(FAR struct ringdev_s *r, char c)
 {
   if (nxsem_trywait(&r->space_sem) < 0) return;
-  r->buf[r->head] = c;
-  r->head = (r->head + 1) % RINGBUF_SIZE;
-  nxsem_post(&r->data_sem);
-  if (r->fds_pollin != NULL) poll_notify(&r->fds_pollin, 1, POLLIN);
+  ringdev_store(r, c);
+}
+
+static void ringdev_puts(FAR struct ringdev_s *r, FAR const char *s)
+{
+  for (; *s; s++) ringdev_putc(r, *s);
 }
 
 static char ringdev_getc(FAR struct ringdev_s *r)
 {
   int ret;
   do { ret = nxsem_wait(&r->data_sem); } while (ret == -EINTR);
-  char c = r->buf[r->tail];
-  r->tail = (r->tail + 1) % RINGBUF_SIZE;
-  nxsem_post(&r->space_sem);
-  return c;
+  return ringdev_take(r);
 }
 
-static int ringdev_open (FAR struct file *f) { return OK; }
-static int ringdev_close(FAR struct file *f) { return OK; }
+static int ringdev_open (FAR struct file *f) { UNUSED(f); return OK; }
+static int ringdev_close(FAR struct file *f) { UNUSED(f); return OK; }
 
 static ssize_t ringdev_read(FAR struct file *filep, FAR char *buf, size_t len)
 {
@@ -634,24 +780,17 @@ static ssize_t ringdev_read(FAR struct file *filep, FAR char *buf, size_t len)
       do { ret = nxsem_wait(&r->data_sem); } while (ret == -EINTR);
       if (ret < 0) return (ssize_t)ret;
     }
-  buf[0] = r->buf[r->tail];
-  r->tail = (r->tail + 1) % RINGBUF_SIZE;
-  nxsem_post(&r->space_sem);
+  buf[0] = ringdev_take(r);
   ssize_t n = 1;
-  while (n < (ssize_t)len)
-    {
-      if (nxsem_trywait(&r->data_sem) < 0) break;
-      buf[n] = r->buf[r->tail];
-      r->tail = (r->tail + 1) % RINGBUF_SIZE;
-      nxsem_post(&r->space_sem);
-      n++;
-    }
+  while (n < (ssize_t)len && nxsem_trywait(&r->data_sem) >= 0)
+    buf[n++] = ringdev_take(r);
   return n;
 }
 
 static ssize_t ringdev_kbd_write(FAR struct file *filep,
                                  FAR const char *buf, size_t len)
 {
+  UNUSED(filep);
   for (size_t i = 0; i < len; i++) ringdev_tryputc(&g_out_ring, buf[i]);
   return (ssize_t)len;
 }
@@ -685,6 +824,7 @@ static int ringdev_kbd_poll(FAR struct file *filep,
 static int ringdev_out_poll(FAR struct file *filep,
                             FAR struct pollfd *fds, bool setup)
 {
+  UNUSED(filep);
   if (setup) poll_notify(&fds, 1, POLLOUT);
   return OK;
 }
@@ -700,6 +840,7 @@ static struct termios g_kbd_termios =
 
 static int ringdev_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
 {
+  UNUSED(filep);
   if (cmd == TCGETS)
     {
       FAR struct termios *t = (FAR struct termios *)(uintptr_t)arg;
@@ -722,12 +863,24 @@ static int ringdev_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
 }
 
 static const struct file_operations g_kbd_ops =
-{ ringdev_open, ringdev_close, ringdev_read, ringdev_kbd_write,
-  NULL, ringdev_ioctl, NULL, NULL, ringdev_kbd_poll };
+{
+  .open  = ringdev_open,
+  .close = ringdev_close,
+  .read  = ringdev_read,
+  .write = ringdev_kbd_write,
+  .ioctl = ringdev_ioctl,
+  .poll  = ringdev_kbd_poll,
+};
 
 static const struct file_operations g_out_ops =
-{ ringdev_open, ringdev_close, ringdev_out_read, ringdev_write,
-  NULL, ringdev_ioctl, NULL, NULL, ringdev_out_poll };
+{
+  .open  = ringdev_open,
+  .close = ringdev_close,
+  .read  = ringdev_out_read,
+  .write = ringdev_write,
+  .ioctl = ringdev_ioctl,
+  .poll  = ringdev_out_poll,
+};
 
 /****************************************************************************
  * Syslog → LCD
@@ -744,8 +897,15 @@ static int lcd_syslog_flush(FAR struct syslog_channel_s *ch)
 { UNUSED(ch); return OK; }
 
 static const struct syslog_channel_ops_s g_lcd_syslog_ops =
-{ lcd_syslog_putc, lcd_syslog_putc, lcd_syslog_flush, NULL };
-static struct syslog_channel_s g_lcd_syslog_channel = { &g_lcd_syslog_ops };
+{
+  .sc_putc  = lcd_syslog_putc,
+  .sc_force = lcd_syslog_putc,
+  .sc_flush = lcd_syslog_flush,
+};
+static struct syslog_channel_s g_lcd_syslog_channel =
+{
+  .sc_ops = &g_lcd_syslog_ops,
+};
 #endif
 
 /****************************************************************************
@@ -762,18 +922,24 @@ static const struct KeyValue_t g_key_map[4][14] =
   { {KEY_TAB,KEY_TAB},{'q','Q'},{'w','W'},{'e','E'},{'r','R'},
     {'t','T'},{'y','Y'},{'u','U'},{'i','I'},{'o','O'},{'p','P'},
     {'[','{'},{']','}'},{'\\','|'} },
-  { {KEY_FN,KEY_FN},{KEY_LEFT_SHIFT,KEY_LEFT_SHIFT},
+  { {(char)KEY_FN,(char)KEY_FN},{(char)KEY_LEFT_SHIFT,(char)KEY_LEFT_SHIFT},
     {'a','A'},{'s','S'},{'d','D'},{'f','F'},{'g','G'},
     {'h','H'},{'j','J'},{'k','K'},{'l','L'},
     {';',':'},{'\'','\"'},{KEY_ENTER,KEY_ENTER} },
-  { {KEY_LEFT_CTRL,KEY_LEFT_CTRL},{(char)KEY_OPT,(char)KEY_OPT},
-    {KEY_LEFT_ALT,KEY_LEFT_ALT},{'z','Z'},{'x','X'},{'c','C'},
+  { {(char)KEY_LEFT_CTRL,(char)KEY_LEFT_CTRL},{(char)KEY_OPT,(char)KEY_OPT},
+    {(char)KEY_LEFT_ALT,(char)KEY_LEFT_ALT},{'z','Z'},{'x','X'},{'c','C'},
     {'v','V'},{'b','B'},{'n','N'},{'m','M'},{',','<'},{'.','>'},{'/','?'},
     {' ',' '} }
 };
 
 /****************************************************************************
  * Soft I2C + TCA8418
+ *
+ *   Only the kbd thread touches these pins, so no lock is needed.  The old
+ *   version wrapped every transaction in enter_critical_section(), which
+ *   kept interrupts off for ~300 µs every 20 ms — bad for the Wi-Fi MAC.
+ *   I2C is fully synchronous (the master owns SCL), so being preempted
+ *   mid-transfer only stretches the clock; the TCA8418 doesn't care.
  ****************************************************************************/
 
 static void soft_i2c_delay(void) { up_udelay(4); }
@@ -825,29 +991,25 @@ static uint8_t soft_i2c_read_byte(bool ack)
 }
 static bool soft_tca8418_write(uint8_t reg, uint8_t val)
 {
-  irqstate_t f=enter_critical_section();
+  bool ok;
   soft_i2c_start();
-  if (!soft_i2c_write_byte(TCA8418_ADDR<<1))
-    { soft_i2c_stop(); leave_critical_section(f); return false; }
-  if (!soft_i2c_write_byte(reg))
-    { soft_i2c_stop(); leave_critical_section(f); return false; }
-  if (!soft_i2c_write_byte(val))
-    { soft_i2c_stop(); leave_critical_section(f); return false; }
-  soft_i2c_stop(); leave_critical_section(f); return true;
+  ok = soft_i2c_write_byte(TCA8418_ADDR<<1) &&
+       soft_i2c_write_byte(reg) &&
+       soft_i2c_write_byte(val);
+  soft_i2c_stop();
+  return ok;
 }
-static bool soft_tca8418_read(uint8_t reg, uint8_t *val)
+static bool soft_tca8418_read(uint8_t reg, FAR uint8_t *val)
 {
-  irqstate_t f=enter_critical_section();
   soft_i2c_start();
-  if (!soft_i2c_write_byte(TCA8418_ADDR<<1))
-    { soft_i2c_stop(); leave_critical_section(f); return false; }
-  if (!soft_i2c_write_byte(reg))
-    { soft_i2c_stop(); leave_critical_section(f); return false; }
+  if (!soft_i2c_write_byte(TCA8418_ADDR<<1) || !soft_i2c_write_byte(reg))
+    { soft_i2c_stop(); return false; }
   soft_i2c_start();
   if (!soft_i2c_write_byte((TCA8418_ADDR<<1)|1))
-    { soft_i2c_stop(); leave_critical_section(f); return false; }
+    { soft_i2c_stop(); return false; }
   *val=soft_i2c_read_byte(false);
-  soft_i2c_stop(); leave_critical_section(f); return true;
+  soft_i2c_stop();
+  return true;
 }
 
 /****************************************************************************
@@ -861,35 +1023,43 @@ enum ui_mode_e
   UI_MODE_SCREENTEST,
   UI_MODE_KEYBOARDTEST,
   UI_MODE_FILEMANAGER,
-  UI_MODE_BATTERY
+  UI_MODE_BATTERY,
+  UI_MODE_WIFI,
+  UI_MODE_COUNT
+};
+
+static const char * const g_mode_title[UI_MODE_COUNT] =
+{
+  "Cardputer", "Terminal", "ScreenTest", "Keyboard", "Files", "Battery",
+  "Wi-Fi"
 };
 
 static volatile int g_ui_mode = UI_MODE_MENU;
 enum { NAV_NONE=0, NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT };
 
-struct menu_item_s { void (*icon)(int,int,uint16_t); const char *label; };
+struct menu_item_s
+{
+  void (*icon)(int, int, uint16_t);
+  FAR const char *label;
+  uint8_t mode;
+};
+
 static const struct menu_item_s g_menu_items[] =
 {
-  { icon_screen,   "ScreenTest" },
-  { icon_keyboard, "Keyboard"   },
-  { icon_terminal, "Terminal"   },
-  { icon_files,    "Files"      },
-  { icon_battery,  "Battery"    },
+  { icon_screen,   "ScreenTest", UI_MODE_SCREENTEST   },
+  { icon_keyboard, "Keyboard",   UI_MODE_KEYBOARDTEST },
+  { icon_terminal, "Terminal",   UI_MODE_TERMINAL     },
+  { icon_files,    "Files",      UI_MODE_FILEMANAGER  },
+  { icon_battery,  "Battery",    UI_MODE_BATTERY      },
+#ifdef CARDPUTER_WIFI
+  { icon_wifi,     "Wi-Fi",      UI_MODE_WIFI         },
+#endif
 };
 #define MENU_COUNT ((int)(sizeof(g_menu_items)/sizeof(g_menu_items[0])))
 static int g_menu_sel = 0;
 
-/* FileManager */
-#define FM_MAX_ENTRIES 64
-#define FM_NAME_LEN    40
-#define FM_VISIBLE     6
-struct fm_entry_s { char name[FM_NAME_LEN]; bool is_dir; };
-static struct fm_entry_s g_fm_entries[FM_MAX_ENTRIES];
-static int  g_fm_count=0, g_fm_sel=0, g_fm_top=0;
-static char g_fm_path[128]="/";
-
 /* ScreenTest */
-static const struct { const char *name; uint16_t color; } g_st_entries[] =
+static const struct { FAR const char *name; uint16_t color; } g_st_entries[] =
 {
   {"WHITE",RGB_WHITE},{"RED",RGB_RED},{"GREEN",RGB_GREEN},
   {"BLUE",RGB_BLUE},{"YELLOW",RGB_YELLOW},{"CYAN",RGB_CYAN},
@@ -898,14 +1068,18 @@ static const struct { const char *name; uint16_t color; } g_st_entries[] =
 #define ST_COLOR_COUNT ((int)(sizeof(g_st_entries)/sizeof(g_st_entries[0])))
 static int g_st_color_idx=0;
 
-/* Battery */
+/****************************************************************************
+ * Battery (ADC read into a cache; drawing never touches the ADC)
+ ****************************************************************************/
+
 #define BAT_ADC_DEVPATH "/dev/adc0"
 #define BAT_ADC_CHANNEL 9
 #define BAT_DIVIDER     2
 
 struct bat_read_s { int mv,err,nsamp,ch0,raw0; };
+static struct bat_read_s g_bat = { -1, 0, 0, -1, 0 };
 
-static void battery_read(struct bat_read_s *o)
+static void battery_read(FAR struct bat_read_s *o)
 {
   o->mv=-1; o->err=0; o->nsamp=0; o->ch0=-1; o->raw0=0;
   int fd=open(BAT_ADC_DEVPATH,O_RDONLY);
@@ -923,10 +1097,17 @@ static void battery_read(struct bat_read_s *o)
   if (o->mv<0 && cnt>0) o->mv=(int)s[0].am_data*BAT_DIVIDER;
   close(fd);
 }
-static int battery_mv(void) { struct bat_read_s r; battery_read(&r); return r.mv; }
+
+static void battery_refresh(void)
+{
+  struct bat_read_s r;
+  battery_read(&r);
+  g_bat = r;
+}
+
 static int battery_percent(int mv)
 {
-  static const struct { int mv,pct; } lut[]=
+  static const struct { int16_t mv; int8_t pct; } lut[]=
   { {4060,100},{3930,92},{3880,85},{3790,70},{3690,55},
     {3600,40},{3500,28},{3400,15},{3310,5},{3170,0} };
   const int n=(int)(sizeof(lut)/sizeof(lut[0]));
@@ -938,134 +1119,118 @@ static int battery_percent(int mv)
   return 0;
 }
 
+static inline uint16_t battery_color(int pct)
+{
+  return (pct<=20)?COL_ERR:(pct<=50)?COL_WARN:COL_OK;
+}
+
 /****************************************************************************
- * Status bar  (compose into framebuffer only — caller does flush)
+ * Status bar
  ****************************************************************************/
 
 static void statusbar_compose(void)
 {
+  if (g_by0 > BAR_H - 1) return;              /* band is below the bar */
+
   gfx_fill_rect(0, 0, LCD_W, BAR_H, COL_BAR_BG);
   gfx_hline(0, BAR_H-1, LCD_W, COL_SEL_BG);
 
-  const char *title;
-  switch (g_ui_mode)
-    {
-      case UI_MODE_TERMINAL:     title="Terminal";   break;
-      case UI_MODE_SCREENTEST:   title="ScreenTest"; break;
-      case UI_MODE_KEYBOARDTEST: title="Keyboard";   break;
-      case UI_MODE_FILEMANAGER:  title="Files";      break;
-      case UI_MODE_BATTERY:      title="Battery";    break;
-      default:                   title="Cardputer";  break;
-    }
-  gtext(6, 0, title, COL_ACCENT);
+  int mode = g_ui_mode;
+  gtext(6, 0, g_mode_title[(mode >= 0 && mode < UI_MODE_COUNT) ? mode : 0],
+        COL_ACCENT);
 
   int bx=LCD_W-30, by=3, bw=24, bh=11;
-  int mv=battery_mv();
+  int mv=g_bat.mv;
+  gfx_round(bx,by,bw,bh,3,COL_DIM);
+  gfx_fill_rect(bx+bw,by+3,2,5,COL_DIM);
   if (mv<0)
     {
-      gfx_round(bx,by,bw,bh,3,COL_DIM);
-      gfx_fill_rect(bx+bw,by+3,2,5,COL_DIM);
       gtext_right(bx-4, 0, "N/A", COL_DIM);
     }
   else
     {
       int pct=battery_percent(mv);
-      uint16_t col=(pct<=20)?COL_ERR:(pct<=50)?COL_WARN:COL_OK;
-      gfx_round(bx,by,bw,bh,3,COL_DIM);
-      gfx_fill_rect(bx+bw,by+3,2,5,COL_DIM);
+      uint16_t col=battery_color(pct);
       int fillw=pct*(bw-6)/100;
       if (fillw>0) gfx_fill_round(bx+3,by+3,fillw,bh-6,1,col);
-      char pbuf[8]; snprintf(pbuf,sizeof(pbuf),"%d%%",pct);
+      char pbuf[16]; snprintf(pbuf,sizeof(pbuf),"%d%%",pct);
       gtext_right(bx-5, 0, pbuf, col);
     }
 }
 
 /****************************************************************************
- * Scrollback buffer
+ * Scrollback buffer  (characters only — 30 B per line)
  *
- * Layout
- * ------
- *   g_sb_lines[slot][col]   char   (slot = abs_line % SCROLLBACK_LINES)
- *   g_sb_colors[slot][col]  colour
- *   g_sb_total              absolute index of current (live) line
- *   g_sb_col                write column on the live line
- *   g_scroll_offset         0 = live view; N = scrolled back N lines
- *
- * Flush discipline
- * ----------------
- *   sb_paint_row_locked(text_row)
- *       Redraws one text_row of the *view* into the framebuffer.
- *       Does NOT touch the SPI bus.
- *
- *   con_putc()
- *       Printable char  → sb_putch → sb_paint_row_locked(live row)
- *                        → gfx_flush_row(live_text_row)    ← 1 row SPI
- *       '\n'            → sb_newline_locked then full-band repaint
- *                        (sb_scroll_screen_locked).  The view is bottom-
- *                        anchored, so every newline shifts ALL rows up by
- *                        one and the whole terminal band must be redrawn.
- *       '\b' '\r'       → sb_paint_row_locked + gfx_flush_row
- *       Suppressed when g_scroll_offset > 0 (user is reading history).
- *
- *   term_repaint_locked()   (fn+UP/DN only)
- *       Repaints all TERM_ROWS + status indicator → gfx_present()
+ *   g_sb[slot][col]   char   (slot = abs_line % SCROLLBACK_LINES)
+ *   g_sb_total        absolute index of current (live) line
+ *   g_sb_col          write column on the live line
+ *   g_scroll_offset   0 = live view; N = scrolled back N lines
  ****************************************************************************/
 
-#define SCROLLBACK_LINES  200
+#define SCROLLBACK_LINES  CARDPUTER_SCROLLBACK_LINES
 #define SB_SLOT(l)        ((l) % SCROLLBACK_LINES)
-#define SB_CH(l,c)        g_sb_lines [SB_SLOT(l)][(c)]
-#define SB_COL(l,c)       g_sb_colors[SB_SLOT(l)][(c)]
+#define SB_CH(l,c)        g_sb[SB_SLOT(l)][(c)]
 
-static char     g_sb_lines [SCROLLBACK_LINES][COLS];
-static uint16_t g_sb_colors[SCROLLBACK_LINES][COLS];
+static char     g_sb[SCROLLBACK_LINES][COLS];
 static int      g_sb_total       = 0;
 static int      g_sb_col         = 0;
 static int      g_scroll_offset  = 0;
 
-static void sb_clear_slot(int slot)
+static inline void sb_clear_line(int abs_line)
 {
-  memset(g_sb_lines[slot], ' ', COLS);
-  for (int c=0; c<COLS; c++) g_sb_colors[slot][c] = COL_FG;
+  memset(g_sb[SB_SLOT(abs_line)], ' ', COLS);
 }
 
-static void sb_clear_line(int abs_line)
-{
-  sb_clear_slot(SB_SLOT(abs_line));
-}
+/* Draw one view row (0-based inside the terminal area). */
 
-/* Paint one view row (0-based within terminal area) into framebuffer.
-   Does NOT flush to SPI. */
-static void sb_paint_row_locked(int view_row)
+static void sb_paint_row(int view_row)
 {
-  /* Which absolute scrollback line maps to this view row? */
-  int first     = g_sb_total - g_scroll_offset - (TERM_ROWS - 1);
-  int abs_line  = first + view_row;
-  int text_row  = TOP_ROW + view_row;
-  int y         = text_row * FONT_H;
+  int y = (TOP_ROW + view_row) * FONT_H;
+  if (!gfx_band_hits(y, FONT_H)) return;
 
   gfx_fill_rect(0, y, LCD_W, FONT_H, COL_BG);
+
+  int abs_line = g_sb_total - g_scroll_offset - (TERM_ROWS - 1) + view_row;
   if (abs_line < 0 || abs_line > g_sb_total) return;
 
-  for (int c=0; c<COLS; c++)
-    {
-      char     ch  = SB_CH (abs_line, c);
-      uint16_t col = SB_COL(abs_line, c);
-      if (ch != ' ') gfx_glyph(c * FONT_W, y, ch, col);
-    }
+  FAR const char *line = g_sb[SB_SLOT(abs_line)];
+  for (int c = 0; c < COLS; c++)
+    if (line[c] != ' ') gfx_glyph(c * FONT_W, y, line[c], COL_FG);
 }
 
-/* The live line is always view_row = TERM_ROWS-1 when scroll_offset==0 */
-static inline int sb_live_view_row(void) { return TERM_ROWS - 1; }
-static inline int sb_live_text_row(void) { return TOP_ROW + sb_live_view_row(); }
-
-/* Scroll the screen up one line: repaint all rows, flush terminal band. */
-static void sb_scroll_screen_locked(void)
+static void term_rows_compose(void)
 {
-  for (int r=0; r<TERM_ROWS; r++) sb_paint_row_locked(r);
-  gfx_flush_band(TERM_Y0, TERM_Y1);
+  for (int r = 0; r < TERM_ROWS; r++) sb_paint_row(r);
 }
 
-/* Commit live line, open next. */
+static void term_compose(void)
+{
+  statusbar_compose();
+  if (g_scroll_offset > 0 && g_by0 < BAR_H)
+    {
+      gfx_fill_rect(LCD_W/2, 0, LCD_W/2, BAR_H, COL_BAR_BG);
+      gfx_hline(LCD_W/2, BAR_H-1, LCD_W/2, COL_SEL_BG);
+      char sbuf[16];
+      snprintf(sbuf, sizeof(sbuf), "^%d", g_scroll_offset);
+      gtext_right(LCD_W - 2, 0, sbuf, COL_WARN);
+    }
+  term_rows_compose();
+}
+
+/* Live line is always the bottom view row while g_scroll_offset == 0 */
+
+#define LIVE_Y   ((TOP_ROW + TERM_ROWS - 1) * FONT_H)
+
+static inline void term_flush_live_locked(void)
+{
+  gfx_render(term_rows_compose, LIVE_Y, LIVE_Y + FONT_H - 1);
+}
+
+static inline void term_flush_band_locked(void)
+{
+  gfx_render(term_rows_compose, TERM_Y0, TERM_Y1);
+}
+
 static void sb_newline_locked(void)
 {
   g_sb_total++;
@@ -1081,111 +1246,55 @@ static int sb_max_offset(void)
   return (m < 0) ? 0 : m;
 }
 
-/****************************************************************************
- * Full terminal repaint — used ONLY for scrollback view changes.
- * Redraws everything then calls gfx_present() (full SPI).
- * Must be called with g_con_mutex held.
- ****************************************************************************/
+/* Full terminal repaint — scrollback view changes only. */
 
 static void term_repaint_locked(void)
 {
-  /* Redraw status bar (scroll indicator or normal) */
-  statusbar_compose();
-  if (g_scroll_offset > 0)
-    {
-      /* Overwrite right half of bar with scroll indicator */
-      gfx_fill_rect(LCD_W/2, 0, LCD_W/2, BAR_H, COL_BAR_BG);
-      char sbuf[16];
-      snprintf(sbuf, sizeof(sbuf), "\x18%d", g_scroll_offset); /* ↑N */
-      gtext_right(LCD_W - 2, 0, sbuf, COL_WARN);
-    }
-
-  /* Repaint all terminal rows */
-  for (int r=0; r<TERM_ROWS; r++) sb_paint_row_locked(r);
-
-  gfx_present();   /* full SPI — acceptable for scroll key events */
+  gfx_render_all(term_compose);
 }
 
 /****************************************************************************
  * con_putc — hot path character output
  *
- * Performance guarantee: every printable character causes at most ONE
- * gfx_flush_row() call (16 pixel rows of SPI).  A newline redraws the whole
- * terminal band via sb_scroll_screen_locked() (one gfx_flush_band of the
- * terminal area) because the view is bottom-anchored: advancing g_sb_total
- * shifts EVERY visible row up by one, so they must all be repainted.
- * gfx_present() is NEVER called from this function.
- *
- * While scrolled (g_scroll_offset > 0) the scrollback store is updated
- * silently; the screen is NOT refreshed so the user's scroll position is
- * preserved.
+ *   printable / '\r' / '\b'  → 1 band  (16 px rows, one SPI transfer)
+ *   '\n' / wrap              → terminal area (8 SPI transfers)
+ *   While scrolled back the store is updated silently.
  ****************************************************************************/
 
-static void con_putc(char c, uint16_t color)
+static void con_putc(char c)
 {
   nxmutex_lock(&g_con_mutex);
 
   if (c == '\r')
     {
       g_sb_col = 0;
-      if (g_scroll_offset == 0)
-        {
-          sb_paint_row_locked(sb_live_view_row());
-          gfx_flush_row(sb_live_text_row());
-        }
     }
   else if (c == '\b')
     {
       if (g_sb_col > 0)
         {
           g_sb_col--;
-          SB_CH (g_sb_total, g_sb_col) = ' ';
-          SB_COL(g_sb_total, g_sb_col) = COL_FG;
+          SB_CH(g_sb_total, g_sb_col) = ' ';
         }
-      if (g_scroll_offset == 0)
-        {
-          sb_paint_row_locked(sb_live_view_row());
-          gfx_flush_row(sb_live_text_row());
-        }
+      if (g_scroll_offset == 0) term_flush_live_locked();
     }
   else if (c == '\n')
     {
-      /* Advance to a fresh live line.  Because the view is bottom-anchored
-       * (the live line is always painted at the bottom terminal row), every
-       * newline shifts ALL visible rows up by one — so the whole terminal
-       * band must be repainted, not just the new bottom row.
-       *
-       * Painting only the bottom row (the old "at_bottom" fast path) was the
-       * cause of output appearing to "jump in place": each printed line was
-       * drawn at the bottom, then erased by the next newline without the
-       * earlier lines ever being shifted up into view.  They only became
-       * visible later, once enough lines accumulated to trigger a full
-       * repaint — hence "the second ls makes both appear".
-       */
       sb_newline_locked();
-      if (g_scroll_offset == 0)
-        sb_scroll_screen_locked();
-      /* if scrolled: silently update store, no screen change */
+      if (g_scroll_offset == 0) term_flush_band_locked();
     }
   else if (c >= 0x20 && (unsigned char)c < 0x80)
     {
       if (g_sb_col >= COLS)
         {
-          /* Soft-wrap: commit line, open next */
           sb_newline_locked();
-          if (g_scroll_offset == 0)
-            sb_scroll_screen_locked();
+          if (g_scroll_offset == 0) term_flush_band_locked();
         }
 
-      SB_CH (g_sb_total, g_sb_col) = c;
-      SB_COL(g_sb_total, g_sb_col) = color;
+      SB_CH(g_sb_total, g_sb_col) = c;
       g_sb_col++;
 
-      if (g_scroll_offset == 0)
-        {
-          sb_paint_row_locked(sb_live_view_row());
-          gfx_flush_row(sb_live_text_row());
-        }
+      if (g_scroll_offset == 0) term_flush_live_locked();
     }
 
   nxmutex_unlock(&g_con_mutex);
@@ -1195,47 +1304,38 @@ static void con_putc(char c, uint16_t color)
  * con_clear / con_clear_full
  ****************************************************************************/
 
-static void con_clear_locked(void)
+static void sb_reset_locked(void)
 {
-  g_sb_total      = 0;
-  g_sb_col        = 0;
-  g_scroll_offset = 0;
-  for (int s=0; s<SCROLLBACK_LINES; s++) sb_clear_slot(s);
-  gfx_fill_rect(0, TERM_Y0, LCD_W, LCD_H - TERM_Y0, COL_BG);
-  gfx_flush_band(TERM_Y0, TERM_Y1);
+  g_sb_total = 0; g_sb_col = 0; g_scroll_offset = 0;
+  memset(g_sb, ' ', sizeof(g_sb));
 }
 
 static void con_clear(void)
 {
   nxmutex_lock(&g_con_mutex);
-  con_clear_locked();
+  sb_reset_locked();
+  term_flush_band_locked();
   nxmutex_unlock(&g_con_mutex);
 }
 
 static void con_clear_full(void)
 {
   nxmutex_lock(&g_con_mutex);
-  g_sb_total=0; g_sb_col=0; g_scroll_offset=0;
-  for (int s=0;s<SCROLLBACK_LINES;s++) sb_clear_slot(s);
-  gfx_clear(COL_BG);
-  gfx_present();
+  sb_reset_locked();
+  gfx_render_all(compose_nothing);
   nxmutex_unlock(&g_con_mutex);
 }
 
 /****************************************************************************
- * Scrollback scroll helpers (called from kbd thread — acquire mutex here)
+ * Scrollback scroll helpers (kbd thread)
  ****************************************************************************/
-
-#define SCROLL_STEP 1
 
 static void term_scroll_up(void)
 {
   nxmutex_lock(&g_con_mutex);
-  int max = sb_max_offset();
-  if (g_scroll_offset < max)
+  if (g_scroll_offset < sb_max_offset())
     {
-      g_scroll_offset += SCROLL_STEP;
-      if (g_scroll_offset > max) g_scroll_offset = max;
+      g_scroll_offset++;
       term_repaint_locked();
     }
   nxmutex_unlock(&g_con_mutex);
@@ -1246,15 +1346,12 @@ static void term_scroll_down(void)
   nxmutex_lock(&g_con_mutex);
   if (g_scroll_offset > 0)
     {
-      g_scroll_offset -= SCROLL_STEP;
-      if (g_scroll_offset < 0) g_scroll_offset = 0;
+      g_scroll_offset--;
       term_repaint_locked();
     }
   nxmutex_unlock(&g_con_mutex);
 }
 
-/* Snap back to live. Returns true if we were scrolled (caller may want to
-   eat the keypress that caused the snap). */
 static bool term_snap_live(void)
 {
   if (g_scroll_offset == 0) return false;
@@ -1273,11 +1370,29 @@ static void bg_compose(void)
 {
   gfx_vgrad(0, 0, LCD_W, LCD_H, COL_BG, COL_BG2);
 }
-static void footer_compose(const char *text)
+
+static void footer_compose(FAR const char *text)
 {
   int y=119;
+  if (!gfx_band_hits(y, FONT_H)) return;
   gfx_fill_circle(8, y+7, 2, COL_ACCENT);
   gtext(14, y, text, COL_DIM);
+}
+
+/* Render a full app screen with the mutex held. */
+
+static void ui_render(compose_t fn)
+{
+  nxmutex_lock(&g_con_mutex);
+  gfx_render_all(fn);
+  nxmutex_unlock(&g_con_mutex);
+}
+
+static void ui_render_rows(compose_t fn, int y0, int y1)
+{
+  nxmutex_lock(&g_con_mutex);
+  gfx_render(fn, y0, y1);
+  nxmutex_unlock(&g_con_mutex);
 }
 
 /****************************************************************************
@@ -1295,8 +1410,9 @@ static void menu_compose(void)
   for (int i=0; i<MENU_COUNT; i++)
     {
       int y=MENU_Y0+i*MENU_STEP;
+      if (!gfx_band_hits(y, MENU_IH)) continue;
       bool sel=(i==g_menu_sel);
-      const struct menu_item_s *m=&g_menu_items[i];
+      FAR const struct menu_item_s *m=&g_menu_items[i];
       if (sel)
         {
           gfx_fill_round_grad(4,y,232,MENU_IH,7,COL_SEL_BG2,COL_SEL_BG);
@@ -1315,40 +1431,24 @@ static void menu_compose(void)
   footer_compose("UP/DN   ENTER   OPT=menu");
 }
 
-static void menu_render(void)
-{
-  nxmutex_lock(&g_con_mutex);
-  menu_compose(); gfx_present();
-  nxmutex_unlock(&g_con_mutex);
-}
-
-static void statusbar_render(void)
-{
-  nxmutex_lock(&g_con_mutex);
-  statusbar_compose();
-  gfx_flush_band(0, BAR_H-1);
-  nxmutex_unlock(&g_con_mutex);
-}
+static void menu_render(void)       { ui_render(menu_compose); }
+static void statusbar_render(void)  { ui_render_rows(statusbar_compose, 0, BAR_H-1); }
 
 /****************************************************************************
  * ScreenTest
  ****************************************************************************/
 
-static void screentest_render(void)
+static void screentest_compose(void)
 {
   uint16_t color=g_st_entries[g_st_color_idx].color;
-  const char *name=g_st_entries[g_st_color_idx].name;
-  nxmutex_lock(&g_con_mutex);
   gfx_clear(color);
   int cw=150,ch=56,cx=(LCD_W-cw)/2,cy=(LCD_H-ch)/2;
   gfx_fill_round(cx,cy,cw,ch,10,COL_BG);
   gfx_round(cx,cy,cw,ch,10,COL_ACCENT);
-  gtext_center(LCD_W/2,cy+10,name,color);
+  gtext_center(LCD_W/2,cy+10,g_st_entries[g_st_color_idx].name,color);
   char idx[16]; snprintf(idx,sizeof(idx),"%d / %d",g_st_color_idx+1,ST_COLOR_COUNT);
   gtext_center(LCD_W/2,cy+30,idx,COL_FG);
   gtext_center(LCD_W/2,LCD_H-16,"UP/DN=colour   OPT=back",COL_DIM);
-  gfx_present();
-  nxmutex_unlock(&g_con_mutex);
 }
 
 static void screentest_handle(int navkey)
@@ -1356,77 +1456,105 @@ static void screentest_handle(int navkey)
   if      (navkey==NAV_UP)   g_st_color_idx=(g_st_color_idx+ST_COLOR_COUNT-1)%ST_COLOR_COUNT;
   else if (navkey==NAV_DOWN) g_st_color_idx=(g_st_color_idx+1)%ST_COLOR_COUNT;
   else return;
-  screentest_render();
+  ui_render(screentest_compose);
 }
 
 /****************************************************************************
  * Keyboard test
  ****************************************************************************/
 
-static void kt_compose_base(void)
+static struct
 {
-  bg_compose(); statusbar_compose();
-  gfx_fill_round_grad(8,22,224,20,6,COL_SEL_BG2,COL_SEL_BG);
-  gtext(16,24,"Keyboard Test",COL_ACCENT);
-}
-static void kt_chip(int x,int y,const char *s,bool on,uint16_t onc)
+  bool    has_key, sh, ct, fn;
+  char    ch;
+  uint8_t raw;
+  uint8_t nav;
+} g_kt;
+
+static void kt_chip(int x,int y,FAR const char *s,bool on,uint16_t onc)
 {
   if (on) { gfx_fill_round(x,y,26,16,4,onc); gtext(x+5,y,s,COL_BG); }
   else    { gfx_round(x,y,26,16,4,COL_DIM);  gtext(x+5,y,s,COL_DIM); }
 }
+
+static void keyboardtest_compose(void)
+{
+  bg_compose(); statusbar_compose();
+  gfx_fill_round_grad(8,22,224,20,6,COL_SEL_BG2,COL_SEL_BG);
+  gtext(16,24,"Keyboard Test",COL_ACCENT);
+  gfx_fill_round(8,48,224,26,6,COL_SEL_BG);
+
+  if (!g_kt.has_key)
+    {
+      gtext_center(LCD_W/2,53,"Press any key ...",COL_DIM);
+      gtext(16,80,"scan  ---",COL_DIM);
+    }
+  else
+    {
+      char key_str[40];
+      FAR const char *name=NULL;
+      char ch=g_kt.ch;
+      if      (g_kt.nav==NAV_UP)    name="UP";
+      else if (g_kt.nav==NAV_DOWN)  name="DOWN";
+      else if (g_kt.nav==NAV_LEFT)  name="LEFT";
+      else if (g_kt.nav==NAV_RIGHT) name="RIGHT";
+
+      if (name)                         snprintf(key_str,sizeof(key_str),"Key:  %s",name);
+      else if (ch=='\r')                snprintf(key_str,sizeof(key_str),"Key:  ENTER");
+      else if (ch=='\t')                snprintf(key_str,sizeof(key_str),"Key:  TAB");
+      else if (ch==(char)KEY_BACKSPACE) snprintf(key_str,sizeof(key_str),"Key:  BACKSPACE");
+      else if (ch>=0x20&&(uint8_t)ch<0x7f)
+        snprintf(key_str,sizeof(key_str),"Key:  '%c'  (0x%02X)",ch,(uint8_t)ch);
+      else snprintf(key_str,sizeof(key_str),"Code: 0x%02X",(uint8_t)ch);
+
+      uint16_t kcol=(ch>=0x20&&(uint8_t)ch<0x7f&&g_kt.nav==NAV_NONE)?COL_SEL_FG:COL_WARN;
+      gtext(16,53,key_str,kcol);
+
+      char scan_str[24]; snprintf(scan_str,sizeof(scan_str),"scan  0x%02X",g_kt.raw);
+      gtext(16,80,scan_str,COL_FG);
+    }
+
+  kt_chip(16,98,"SH",g_kt.sh,COL_WARN);
+  kt_chip(48,98,"CT",g_kt.ct,COL_ACCENT);
+  kt_chip(80,98,"FN",g_kt.fn,COL_FG);
+  footer_compose("Key shown above   OPT=back");
+}
+
 static void keyboardtest_enter(void)
 {
-  nxmutex_lock(&g_con_mutex);
-  kt_compose_base();
-  gfx_fill_round(8,48,224,26,6,COL_SEL_BG);
-  gtext_center(LCD_W/2,53,"Press any key ...",COL_DIM);
-  gtext(16,80,"scan  ---",COL_DIM);
-  kt_chip(16,98,"SH",false,COL_WARN);
-  kt_chip(48,98,"CT",false,COL_ACCENT);
-  kt_chip(80,98,"FN",false,COL_FG);
-  footer_compose("Key shown above   OPT=back");
-  gfx_present();
-  nxmutex_unlock(&g_con_mutex);
+  memset(&g_kt, 0, sizeof(g_kt));
+  ui_render(keyboardtest_compose);
 }
+
 static void keyboardtest_show(char ch,uint8_t raw,int navkey,
                               bool sh,bool ct,bool fn)
 {
-  char key_str[40];
-  const char *name=NULL;
-  if      (navkey==NAV_UP)    name="UP";
-  else if (navkey==NAV_DOWN)  name="DOWN";
-  else if (navkey==NAV_LEFT)  name="LEFT";
-  else if (navkey==NAV_RIGHT) name="RIGHT";
-
-  if (name)                           snprintf(key_str,sizeof(key_str),"Key:  %s",name);
-  else if (ch=='\r')                  snprintf(key_str,sizeof(key_str),"Key:  ENTER");
-  else if (ch=='\t')                  snprintf(key_str,sizeof(key_str),"Key:  TAB");
-  else if (ch==(char)KEY_BACKSPACE)   snprintf(key_str,sizeof(key_str),"Key:  BACKSPACE");
-  else if (ch>=0x20&&(uint8_t)ch<0x7f)
-    snprintf(key_str,sizeof(key_str),"Key:  '%c'  (0x%02X)",ch,(uint8_t)ch);
-  else snprintf(key_str,sizeof(key_str),"Code: 0x%02X",(uint8_t)ch);
-
-  char scan_str[24]; snprintf(scan_str,sizeof(scan_str),"scan  0x%02X",raw);
-
-  nxmutex_lock(&g_con_mutex);
-  uint16_t kcol=(ch>=0x20&&(uint8_t)ch<0x7f&&navkey==NAV_NONE)?COL_SEL_FG:COL_WARN;
-  gfx_fill_round(8,48,224,26,6,COL_SEL_BG);
-  gtext(16,53,key_str,kcol);
-  gfx_fill_rect(8,80,224,16,COL_BG);
-  gtext(16,80,scan_str,COL_FG);
-  kt_chip(16,98,"SH",sh,COL_WARN);
-  kt_chip(48,98,"CT",ct,COL_ACCENT);
-  kt_chip(80,98,"FN",fn,COL_FG);
-  gfx_flush_band(48,113);
-  nxmutex_unlock(&g_con_mutex);
+  g_kt.has_key=true; g_kt.ch=ch; g_kt.raw=raw; g_kt.nav=(uint8_t)navkey;
+  g_kt.sh=sh; g_kt.ct=ct; g_kt.fn=fn;
+  ui_render_rows(keyboardtest_compose, 48, 113);   /* only the key area */
 }
 
 /****************************************************************************
- * FileManager
+ * FileManager  (streams the directory; keeps only the visible window)
  ****************************************************************************/
 
-#define FM_ROW_H 15
-#define FM_Y0    38
+#define FM_ROW_H    15
+#define FM_Y0       38
+#define FM_VISIBLE  6
+#define FM_SHOW_LEN 26                 /* (240 - 30) / 8 columns */
+
+struct fm_vis_s { char name[FM_SHOW_LEN + 1]; bool is_dir; };
+
+static struct fm_vis_s g_fm_vis[FM_VISIBLE];
+static int  g_fm_count=0, g_fm_sel=0, g_fm_top=0;
+static char g_fm_path[128]="/";
+
+static inline bool fm_has_parent(void) { return strcmp(g_fm_path, "/") != 0; }
+
+static inline bool fm_skip(FAR const struct dirent *e)
+{
+  return strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0;
+}
 
 static void fm_dir_icon(int x,int y,uint16_t a)
 {
@@ -1436,95 +1564,155 @@ static void fm_file_icon(int x,int y,uint16_t a)
 {
   gfx_round(x+1,y+1,8,10,1,a); gfx_line(x+6,y+1,x+8,y+3,a);
 }
+
 static void fm_load(void)
 {
-  g_fm_count=0; g_fm_sel=0; g_fm_top=0;
-  if (strcmp(g_fm_path,"/")!=0)
-    {
-      snprintf(g_fm_entries[0].name,FM_NAME_LEN,"..");
-      g_fm_entries[0].is_dir=true; g_fm_count=1;
-    }
-  DIR *d=opendir(g_fm_path);
+  g_fm_count = fm_has_parent() ? 1 : 0;
+  g_fm_sel = 0; g_fm_top = 0;
+  FAR DIR *d = opendir(g_fm_path);
   if (d)
     {
-      struct dirent *e;
-      while ((e=readdir(d))!=NULL && g_fm_count<FM_MAX_ENTRIES)
-        {
-          snprintf(g_fm_entries[g_fm_count].name,FM_NAME_LEN,"%.*s",FM_NAME_LEN-1,e->d_name);
-          g_fm_entries[g_fm_count].is_dir=(e->d_type==DT_DIR);
-          g_fm_count++;
-        }
+      FAR struct dirent *e;
+      while ((e = readdir(d)) != NULL)
+        if (!fm_skip(e)) g_fm_count++;
       closedir(d);
     }
 }
-static void fm_join(const char *name)
+
+/* Fill g_fm_vis[] with entries [g_fm_top .. g_fm_top + FM_VISIBLE). */
+
+static void fm_fill_visible(void)
+{
+  int hp = fm_has_parent() ? 1 : 0;
+  memset(g_fm_vis, 0, sizeof(g_fm_vis));
+
+  if (hp && g_fm_top == 0)
+    { strlcpy(g_fm_vis[0].name, "..", sizeof(g_fm_vis[0].name)); g_fm_vis[0].is_dir = true; }
+
+  int first = g_fm_top - hp;          /* dir index shown in slot 0 */
+  FAR DIR *d = opendir(g_fm_path);
+  if (!d) return;
+  FAR struct dirent *e;
+  int n = 0;
+  while ((e = readdir(d)) != NULL)
+    {
+      if (fm_skip(e)) continue;
+      int slot = n - first;
+      if (slot >= FM_VISIBLE) break;
+      if (slot >= 0)
+        {
+          strlcpy(g_fm_vis[slot].name, e->d_name, sizeof(g_fm_vis[slot].name));
+          g_fm_vis[slot].is_dir = (e->d_type == DT_DIR);
+        }
+      n++;
+    }
+  closedir(d);
+}
+
+static bool fm_join(FAR const char *name)
 {
   if (strcmp(name,"..")==0)
     {
-      char *s=strrchr(g_fm_path,'/');
+      FAR char *s=strrchr(g_fm_path,'/');
       if (s) { if (s==g_fm_path) g_fm_path[1]='\0'; else *s='\0'; }
-      return;
+      return true;
     }
   size_t len=strlen(g_fm_path);
-  if (len>0 && g_fm_path[len-1]=='/')
-    snprintf(g_fm_path+len,sizeof(g_fm_path)-len,"%s",name);
-  else
-    snprintf(g_fm_path+len,sizeof(g_fm_path)-len,"/%s",name);
+  bool slash = (len>0 && g_fm_path[len-1]=='/');
+  if (len + (slash ? 0 : 1) + strlen(name) + 1 > sizeof(g_fm_path)) return false;
+  snprintf(g_fm_path+len,sizeof(g_fm_path)-len, slash ? "%s" : "/%s", name);
+  return true;
 }
-static void fm_render(void)
+
+/* Enter the selected entry if it is a directory (re-reads its full name). */
+
+static bool fm_open_selected(void)
 {
-  nxmutex_lock(&g_con_mutex);
+  int hp = fm_has_parent() ? 1 : 0;
+  if (hp && g_fm_sel == 0) return fm_join("..");
+
+  int want = g_fm_sel - hp, n = 0;
+  bool ok = false;
+  FAR DIR *d = opendir(g_fm_path);
+  if (!d) return false;
+  FAR struct dirent *e;
+  while ((e = readdir(d)) != NULL)
+    {
+      if (fm_skip(e)) continue;
+      if (n++ == want)
+        {
+          if (e->d_type == DT_DIR) ok = fm_join(e->d_name);
+          break;
+        }
+    }
+  closedir(d);
+  return ok;
+}
+
+static void fm_compose(void)
+{
   bg_compose(); statusbar_compose();
   gfx_fill_round(6,20,228,14,4,COL_SEL_BG);
   char pbuf[28]; snprintf(pbuf,sizeof(pbuf),"%.26s",g_fm_path);
   gtext(12,19,pbuf,COL_ACCENT);
   if (g_fm_count>FM_VISIBLE)
     {
-      char sc[10]; snprintf(sc,sizeof(sc),"%d/%d",g_fm_sel+1,g_fm_count);
+      char sc[24]; snprintf(sc,sizeof(sc),"%d/%d",g_fm_sel+1,g_fm_count);
       gtext_right(LCD_W-10,19,sc,COL_DIM);
     }
-  if (g_fm_sel<g_fm_top) g_fm_top=g_fm_sel;
-  if (g_fm_sel>=g_fm_top+FM_VISIBLE) g_fm_top=g_fm_sel-FM_VISIBLE+1;
   for (int i=0;i<FM_VISIBLE;i++)
     {
       int idx=g_fm_top+i, y=FM_Y0+i*FM_ROW_H;
-      if (idx>=g_fm_count) continue;
-      bool sel=(idx==g_fm_sel), is_dir=g_fm_entries[idx].is_dir;
-      const char *nm=g_fm_entries[idx].name;
+      if (idx>=g_fm_count || !gfx_band_hits(y, FM_ROW_H + 1)) continue;
+      bool sel=(idx==g_fm_sel), is_dir=g_fm_vis[i].is_dir;
       uint16_t icol=is_dir?COL_ACCENT:COL_DIM;
       if (sel) { gfx_fill_round(4,y,232,FM_ROW_H-1,5,COL_SEL_BG);
                  gfx_fill_round(6,y+2,3,FM_ROW_H-5,1,COL_MARKER); }
       if (is_dir) fm_dir_icon(13,y+1,icol);
       else        fm_file_icon(13,y+1,icol);
-      gtext(30,y,nm,sel?COL_SEL_FG:(is_dir?COL_FG:COL_DIM));
+      gtext(30,y,g_fm_vis[i].name,sel?COL_SEL_FG:(is_dir?COL_FG:COL_DIM));
     }
-  gfx_present();
-  nxmutex_unlock(&g_con_mutex);
 }
+
+static void fm_render(void)
+{
+  int old_top = g_fm_top;
+  if (g_fm_sel<g_fm_top) g_fm_top=g_fm_sel;
+  if (g_fm_sel>=g_fm_top+FM_VISIBLE) g_fm_top=g_fm_sel-FM_VISIBLE+1;
+  if (old_top != g_fm_top) fm_fill_visible();     /* re-read only on scroll */
+  ui_render(fm_compose);
+}
+
+static void fm_reload_render(void)
+{
+  fm_load();
+  fm_fill_visible();
+  ui_render(fm_compose);
+}
+
 static void filemanager_enter(void)
 {
-  snprintf(g_fm_path,sizeof(g_fm_path),"/"); fm_load(); fm_render();
+  snprintf(g_fm_path,sizeof(g_fm_path),"/");
+  fm_reload_render();
 }
+
 static void filemanager_handle(int navkey,char ch)
 {
-  if      (navkey==NAV_UP)   { if (g_fm_count) g_fm_sel=(g_fm_sel+g_fm_count-1)%g_fm_count; fm_render(); }
-  else if (navkey==NAV_DOWN) { if (g_fm_count) g_fm_sel=(g_fm_sel+1)%g_fm_count; fm_render(); }
-  else if (ch=='\r'||ch=='\n')
-    {
-      if (!g_fm_count) return;
-      if (g_fm_entries[g_fm_sel].is_dir)
-        { fm_join(g_fm_entries[g_fm_sel].name); fm_load(); fm_render(); }
-    }
+  if (navkey==NAV_UP)
+    { if (g_fm_count) { g_fm_sel=(g_fm_sel+g_fm_count-1)%g_fm_count; fm_render(); } }
+  else if (navkey==NAV_DOWN)
+    { if (g_fm_count) { g_fm_sel=(g_fm_sel+1)%g_fm_count; fm_render(); } }
+  else if ((ch=='\r'||ch=='\n') && g_fm_count)
+    { if (fm_open_selected()) fm_reload_render(); }
 }
 
 /****************************************************************************
  * Battery app
  ****************************************************************************/
 
-static void battery_render(void)
+static void battery_compose(void)
 {
-  struct bat_read_s r; battery_read(&r);
-  nxmutex_lock(&g_con_mutex);
+  struct bat_read_s r = g_bat;
   bg_compose(); statusbar_compose();
   if (r.mv<0)
     {
@@ -1542,7 +1730,7 @@ static void battery_render(void)
   else
     {
       int pct=battery_percent(r.mv);
-      uint16_t col=(pct<=20)?COL_ERR:(pct<=50)?COL_WARN:COL_OK;
+      uint16_t col=battery_color(pct);
       int bx=30,by=36,bw=150,bh=48;
       gfx_round(bx,by,bw,bh,8,col);
       gfx_round(bx+1,by+1,bw-2,bh-2,7,col);
@@ -1551,38 +1739,699 @@ static void battery_render(void)
       if (fillw>0)
         gfx_fill_round_grad(bx+6,by+6,fillw,bh-12,4,
                             gfx_blend565(col,RGB_WHITE,10),col);
-      char big[8]; snprintf(big,sizeof(big),"%d%%",pct);
+      char big[16]; snprintf(big,sizeof(big),"%d%%",pct);
       gtext_center(bx+bw/2,by+bh/2-8,big,COL_SEL_FG);
       char line[40];
       snprintf(line,sizeof(line),"Voltage  %d mV",r.mv);
       gtext(30,94,line,COL_FG);
-      const char *state=(pct>=95)?"Full":(pct<=20)?"Low - charge soon":"OK";
+      FAR const char *state=(pct>=95)?"Full":(pct<=20)?"Low - charge soon":"OK";
       snprintf(line,sizeof(line),"Status   %s",state);
       gtext(30,110,line,col);
     }
   footer_compose("auto-refresh   OPT=back");
-  gfx_present();
-  nxmutex_unlock(&g_con_mutex);
 }
-static void battery_enter(void) { battery_render(); }
+
+static void battery_render(void)
+{
+  battery_refresh();
+  ui_render(battery_compose);
+}
+
+/****************************************************************************
+ * Wi-Fi app
+ *
+ *   LIST  : link status card + scan results (strongest first)
+ *           s = scan   r = refresh status   ENTER = join   UP/DN = select
+ *   PASS  : type the passphrase   TAB = show/hide   ENTER = connect
+ *           fn+LEFT = back to the list   (empty passphrase = open network)
+ *
+ *   Scan, status and join use the wireless ioctls directly from the kernel
+ *   (psock_*: no fd, no libc socket table) — the same requests `wapi scan`,
+ *   `wapi psk` and `wapi essid` send, so the passphrase never passes
+ *   through the shell.  After association the terminal opens and runs
+ *   `renew wlan0` (stock DHCP client) so you can watch the lease arrive.
+ *
+ *   All state lives in one heap block that exists only while the app is
+ *   open (≈460 B) and is zeroed before it is freed.
+ ****************************************************************************/
+
+#ifdef CARDPUTER_WIFI
+
+#define WIFI_IFNAME      "wlan0"
+#define WIFI_MAX_AP      8
+#define WIFI_VISIBLE     4
+#define WIFI_LIST_Y0     54
+#define WIFI_ROW_H       15
+#define WIFI_PASS_MAX    63
+#define WIFI_STATUS_MS   3000
+
+enum { WIFI_ST_LIST = 0, WIFI_ST_PASS };
+
+struct wifi_ap_s
+{
+  char    ssid[IW_ESSID_MAX_SIZE + 1];
+  int8_t  rssi;
+  uint8_t chan;
+};
+
+struct wifi_ui_s
+{
+  struct wifi_ap_s ap[WIFI_MAX_AP];
+  int8_t  nap, sel, top, state;
+  bool    show_pass, scanned, up, running;
+  int8_t  rssi;                              /* dBm, 0 = unknown */
+  uint8_t passlen;
+  char    pass[WIFI_PASS_MAX + 1];
+  char    cur_ssid[IW_ESSID_MAX_SIZE + 1];
+  char    ip[16];
+  char    msg[30];                           /* one-line notice */
+};
+
+static FAR struct wifi_ui_s *g_wifi = NULL;
+
+static void wifi_free(void)
+{
+  FAR struct wifi_ui_s *w = g_wifi;
+  if (w == NULL) return;
+  g_wifi = NULL;
+  memset(w, 0, sizeof(*w));                 /* wipe the passphrase */
+  kmm_free(w);
+}
+
+static int wifi_sock(FAR struct socket *s)
+{
+  int ret = psock_socket(AF_INET, SOCK_DGRAM, 0, s);
+  if (ret < 0) ret = psock_socket(AF_INET, SOCK_STREAM, 0, s);
+  return ret;
+}
+
+static inline void wifi_ifname(FAR char *dst)
+{
+  strlcpy(dst, WIFI_IFNAME, IFNAMSIZ);
+}
+
+static int8_t rssi_from_dbm(int v)
+{
+  if (v > 0) v = -v;            /* ESP driver reports -(rssi) */
+  if (v < -127) v = -127;
+  return (int8_t)v;
+}
+
+static int rssi_bars(int rssi)
+{
+  if (rssi == 0)   return 0;
+  if (rssi >= -60) return 3;
+  if (rssi >= -72) return 2;
+  if (rssi >= -85) return 1;
+  return 0;
+}
+
+static void wifi_status_refresh(FAR struct wifi_ui_s *w)
+{
+  struct socket s;
+  struct ifreq  ifr;
+  struct iwreq  iwr;
+
+  w->up = w->running = false;
+  w->cur_ssid[0] = '\0';
+  w->rssi = 0;
+  strlcpy(w->ip, "-", sizeof(w->ip));
+
+  if (wifi_sock(&s) < 0)
+    {
+      strlcpy(w->msg, "socket() failed", sizeof(w->msg));
+      return;
+    }
+
+  memset(&ifr, 0, sizeof(ifr));
+  wifi_ifname(ifr.ifr_name);
+  if (psock_ioctl(&s, SIOCGIFFLAGS, (unsigned long)(uintptr_t)&ifr) >= 0)
+    {
+      w->up      = (ifr.ifr_flags & IFF_UP) != 0;
+      w->running = (ifr.ifr_flags & IFF_RUNNING) != 0;
+    }
+  else
+    {
+      strlcpy(w->msg, "no " WIFI_IFNAME " device", sizeof(w->msg));
+    }
+
+  memset(&ifr, 0, sizeof(ifr));
+  wifi_ifname(ifr.ifr_name);
+  if (psock_ioctl(&s, SIOCGIFADDR, (unsigned long)(uintptr_t)&ifr) >= 0)
+    {
+      FAR struct sockaddr_in *sin = (FAR struct sockaddr_in *)&ifr.ifr_addr;
+      uint32_t a = ntohl(sin->sin_addr.s_addr);
+      if (a != 0)
+        snprintf(w->ip, sizeof(w->ip), "%u.%u.%u.%u",
+                 (unsigned)(a >> 24) & 0xff, (unsigned)(a >> 16) & 0xff,
+                 (unsigned)(a >> 8) & 0xff,  (unsigned)a & 0xff);
+    }
+
+  if (w->running)
+    {
+      memset(&iwr, 0, sizeof(iwr));
+      wifi_ifname(iwr.ifr_name);
+      iwr.u.essid.pointer = w->cur_ssid;
+      iwr.u.essid.length  = IW_ESSID_MAX_SIZE;
+      memset(w->cur_ssid, 0, sizeof(w->cur_ssid));
+      if (psock_ioctl(&s, SIOCGIWESSID, (unsigned long)(uintptr_t)&iwr) < 0)
+        w->cur_ssid[0] = '\0';
+      w->cur_ssid[IW_ESSID_MAX_SIZE] = '\0';
+
+      memset(&iwr, 0, sizeof(iwr));
+      wifi_ifname(iwr.ifr_name);
+      if (psock_ioctl(&s, SIOCGIWSENS, (unsigned long)(uintptr_t)&iwr) >= 0)
+        w->rssi = rssi_from_dbm(iwr.u.sens.value);
+    }
+
+  psock_close(&s);
+}
+
+/* Insert keeping the list sorted by RSSI and free of duplicate SSIDs. */
+
+static void wifi_add_ap(FAR struct wifi_ui_s *w,
+                        FAR const struct wifi_ap_s *ap)
+{
+  int i;
+  if (ap->ssid[0] == '\0') return;                    /* hidden network */
+
+  for (i = 0; i < w->nap; i++)
+    {
+      if (strcmp(w->ap[i].ssid, ap->ssid) == 0)
+        {
+          if (ap->rssi <= w->ap[i].rssi) return;      /* keep stronger */
+          memmove(&w->ap[i], &w->ap[i + 1],
+                  (w->nap - i - 1) * sizeof(w->ap[0]));
+          w->nap--;
+          break;
+        }
+    }
+
+  i = 0;
+  while (i < w->nap && w->ap[i].rssi >= ap->rssi) i++;
+  if (i >= WIFI_MAX_AP) return;
+
+  int n = w->nap < WIFI_MAX_AP ? w->nap : WIFI_MAX_AP - 1;
+  memmove(&w->ap[i + 1], &w->ap[i], (n - i) * sizeof(w->ap[0]));
+  w->ap[i] = *ap;
+  if (w->nap < WIFI_MAX_AP) w->nap++;
+}
+
+/* Walk the iw_event stream returned by SIOCGIWSCAN. */
+
+static void wifi_parse_scan(FAR struct wifi_ui_s *w,
+                            FAR const uint8_t *buf, size_t len)
+{
+  const size_t hdr = offsetof(struct iw_event, u);
+  struct wifi_ap_s cur;
+  bool have = false;
+  size_t off = 0;
+
+  memset(&cur, 0, sizeof(cur));
+  while (off + hdr <= len)
+    {
+      struct iw_event iwe;
+      size_t avail = len - off;
+
+      memset(&iwe, 0, sizeof(iwe));
+      memcpy(&iwe, buf + off, avail < sizeof(iwe) ? avail : sizeof(iwe));
+      if (iwe.len < hdr || iwe.len > avail) break;
+
+      switch (iwe.cmd)
+        {
+          case SIOCGIWAP:                       /* start of a new BSS */
+            if (have) wifi_add_ap(w, &cur);
+            memset(&cur, 0, sizeof(cur));
+            have = true;
+            break;
+
+          case SIOCGIWESSID:
+            {
+              size_t l = iwe.u.essid.length;
+              size_t p = off + hdr + (size_t)(uintptr_t)iwe.u.essid.pointer;
+              if (l > IW_ESSID_MAX_SIZE) l = IW_ESSID_MAX_SIZE;
+              if (p + l <= len)
+                {
+                  memcpy(cur.ssid, buf + p, l);
+                  cur.ssid[l] = '\0';
+                }
+            }
+            break;
+
+          case IWEVQUAL:
+            cur.rssi = (int8_t)iwe.u.qual.level;
+            break;
+
+          case SIOCGIWFREQ:
+            if (iwe.u.freq.e == 0 && iwe.u.freq.m > 0 && iwe.u.freq.m < 200)
+              cur.chan = (uint8_t)iwe.u.freq.m;
+            break;
+
+          default:
+            break;
+        }
+
+      off += iwe.len;
+    }
+
+  if (have) wifi_add_ap(w, &cur);
+}
+
+static int wifi_do_scan(FAR struct wifi_ui_s *w)
+{
+  struct socket s;
+  struct iwreq  iwr;
+  FAR uint8_t  *buf = NULL;
+  uint16_t      size = 0;
+  int           ret;
+
+  w->nap = 0; w->sel = 0; w->top = 0;
+
+  ret = wifi_sock(&s);
+  if (ret < 0) return ret;
+
+  memset(&iwr, 0, sizeof(iwr));
+  wifi_ifname(iwr.ifr_name);
+  ret = psock_ioctl(&s, SIOCSIWSCAN, (unsigned long)(uintptr_t)&iwr);
+
+  /* The driver blocks until the scan is done.  A NULL buffer asks for the
+   * result size (-E2BIG); the second call copies and frees the driver's
+   * copy.  -EAGAIN (other drivers) means "not done yet".
+   */
+
+  for (int tries = 0; ret >= 0 && tries < 20; tries++)
+    {
+      memset(&iwr, 0, sizeof(iwr));
+      wifi_ifname(iwr.ifr_name);
+      iwr.u.data.pointer = buf;
+      iwr.u.data.length  = size;
+      ret = psock_ioctl(&s, SIOCGIWSCAN, (unsigned long)(uintptr_t)&iwr);
+
+      if (ret == -EAGAIN)
+        {
+          ret = 0;
+          usleep(250 * 1000);
+          continue;
+        }
+
+      if (ret == -E2BIG && buf == NULL)
+        {
+          size = iwr.u.data.length ? iwr.u.data.length : 2048;
+          buf  = kmm_malloc(size);
+          ret  = buf ? 0 : -ENOMEM;
+          continue;
+        }
+
+      if (ret >= 0 && buf != NULL)
+        wifi_parse_scan(w, buf, iwr.u.data.length);
+      break;
+    }
+
+  if (buf) kmm_free(buf);
+  psock_close(&s);
+  w->scanned = true;
+  return ret < 0 ? ret : w->nap;
+}
+
+/* --- drawing ------------------------------------------------------------ */
+
+static void wifi_list_compose(FAR struct wifi_ui_s *w)
+{
+  /* Status card */
+
+  gfx_fill_round(6, 19, 228, 33, 6, COL_SEL_BG);
+  gfx_wifi_glyph(220, 44, w->running ? rssi_bars(w->rssi) : 0,
+                 COL_ACCENT, COL_DIM);
+
+  char line[32];
+  if (w->running)
+    {
+      snprintf(line, sizeof(line), "%.24s",
+               w->cur_ssid[0] ? w->cur_ssid : "(connected)");
+      gtext(12, 19, line, COL_SEL_FG);
+      if (w->rssi)
+        snprintf(line, sizeof(line), "%-15s %ddBm", w->ip, w->rssi);
+      else
+        snprintf(line, sizeof(line), "%s", w->ip);
+      gtext(12, 35, line, COL_FG);
+    }
+  else
+    {
+      gtext(12, 19, w->up ? "Not connected" : WIFI_IFNAME " is down",
+            COL_WARN);
+      gtext(12, 35, w->msg[0] ? w->msg : "s = scan networks", COL_DIM);
+    }
+
+  /* Scan results */
+
+  if (w->nap == 0)
+    {
+      gtext_center(LCD_W / 2, 70,
+                   w->scanned ? "No networks found" : "Press s to scan",
+                   COL_DIM);
+    }
+
+  for (int i = 0; i < WIFI_VISIBLE; i++)
+    {
+      int idx = w->top + i, y = WIFI_LIST_Y0 + i * WIFI_ROW_H;
+      if (idx >= w->nap || !gfx_band_hits(y, WIFI_ROW_H + 1)) continue;
+      FAR const struct wifi_ap_s *ap = &w->ap[idx];
+      bool sel = (idx == w->sel);
+      if (sel)
+        {
+          gfx_fill_round(4, y, 232, WIFI_ROW_H - 1, 5, COL_SEL_BG);
+          gfx_fill_round(6, y + 2, 3, WIFI_ROW_H - 5, 1, COL_MARKER);
+        }
+      gfx_wifi_glyph(19, y + 12, rssi_bars(ap->rssi),
+                     sel ? COL_ACCENT : COL_FG, COL_DIM);
+      snprintf(line, sizeof(line), "%.19s", ap->ssid);
+      gtext(32, y, line, sel ? COL_SEL_FG : COL_FG);
+      snprintf(line, sizeof(line), "%d", ap->rssi);
+      gtext_right(LCD_W - 10, y, line, COL_DIM);
+    }
+
+  if (w->nap > WIFI_VISIBLE)
+    {
+      snprintf(line, sizeof(line), "%d/%d", w->sel + 1, w->nap);
+      gtext_right(LCD_W - 6, 119, line, COL_DIM);
+    }
+
+  footer_compose("s=scan ENTER=join");
+}
+
+static void wifi_pass_compose(FAR struct wifi_ui_s *w)
+{
+  char line[40];
+  FAR const struct wifi_ap_s *ap = &w->ap[w->sel];
+
+  gfx_fill_round_grad(8, 20, 224, 20, 6, COL_SEL_BG2, COL_SEL_BG);
+  snprintf(line, sizeof(line), "Join %.22s", ap->ssid);
+  gtext(16, 22, line, COL_ACCENT);
+
+  gtext(12, 46, "Passphrase", COL_DIM);
+  gfx_fill_round(8, 62, 224, 22, 6, COL_SEL_BG);
+  gfx_round(8, 62, 224, 22, 6, COL_ACCENT);
+
+  /* Show the tail of the passphrase that fits (26 columns) */
+
+  int vis = w->passlen > 25 ? 25 : w->passlen;
+  int from = w->passlen - vis;
+  for (int i = 0; i < vis; i++)
+    {
+      char c = w->show_pass ? w->pass[from + i] : '*';
+      if (!w->show_pass && i == vis - 1) c = w->pass[from + i];  /* last key */
+      gfx_glyph(16 + i * FONT_W, 65, c, COL_SEL_FG);
+    }
+  gfx_fill_rect(16 + vis * FONT_W, 66, 2, 14, COL_ACCENT);      /* cursor */
+
+  snprintf(line, sizeof(line), "%d chars  %s", w->passlen,
+           w->passlen == 0 ? "(open net)" :
+           w->passlen < 8  ? "(min 8)"    : "");
+  gtext(12, 90, line, (w->passlen && w->passlen < 8) ? COL_WARN : COL_DIM);
+  if (w->msg[0]) gtext(12, 104, w->msg, COL_WARN);
+
+  footer_compose("TAB=show ENTER=go fn+j=back");
+}
+
+static void wifi_compose(void)
+{
+  FAR struct wifi_ui_s *w = g_wifi;
+  bg_compose(); statusbar_compose();
+
+  if (w == NULL)
+    {
+      gtext_center(LCD_W / 2, 60, "Out of memory", COL_ERR);
+      footer_compose("OPT=back");
+      return;
+    }
+
+  if (w->state == WIFI_ST_PASS) wifi_pass_compose(w);
+  else                          wifi_list_compose(w);
+}
+
+static void wifi_scanning_compose(void)
+{
+  bg_compose(); statusbar_compose();
+  gfx_fill_round(30, 48, 180, 40, 10, COL_SEL_BG);
+  gfx_round(30, 48, 180, 40, 10, COL_ACCENT);
+  gfx_wifi_glyph(52, 76, 3, COL_ACCENT, COL_DIM);
+  gtext(72, 60, "Scanning...", COL_SEL_FG);
+}
+
+static void wifi_render(void) { ui_render(wifi_compose); }
+
+/* --- actions ------------------------------------------------------------ */
+
+static void wifi_enter(void)
+{
+  if (g_wifi == NULL) g_wifi = kmm_zalloc(sizeof(struct wifi_ui_s));
+  if (g_wifi != NULL) wifi_status_refresh(g_wifi);
+  wifi_render();
+}
+
+static void wifi_scan(FAR struct wifi_ui_s *w)
+{
+  ui_render(wifi_scanning_compose);
+  int ret = wifi_do_scan(w);
+  if (ret < 0) snprintf(w->msg, sizeof(w->msg), "scan failed (%d)", ret);
+  else         w->msg[0] = '\0';
+  wifi_status_refresh(w);
+  wifi_render();
+}
+
+static void kbd_echo_str(FAR const char *s);
+static void ui_enter_mode(int mode);
+
+static int wifi_set_auth(FAR struct socket *s, int idx, uint32_t value)
+{
+  struct iwreq iwr;
+  memset(&iwr, 0, sizeof(iwr));
+  wifi_ifname(iwr.ifr_name);
+  iwr.u.param.flags = idx & IW_AUTH_INDEX;
+  iwr.u.param.value = value;
+  int ret = psock_ioctl(s, SIOCSIWAUTH, (unsigned long)(uintptr_t)&iwr);
+  return ret == -EOPNOTSUPP ? 0 : ret;
+}
+
+/* The same three steps `wapi psk` + `wapi essid ... 1` perform, done in
+ * the kernel so the passphrase never goes through the shell (no quoting
+ * problems, no LINE_MAX limit, nothing in NSH's line buffer).
+ * Blocks until associated or CONFIG_ESPRESSIF_WIFI_CONNECT_TIMEOUT.
+ */
+
+static int wifi_join(FAR const char *ssid, FAR const char *pass, size_t plen)
+{
+  uint8_t kbuf[sizeof(struct iw_encode_ext) + WIFI_PASS_MAX] aligned_data(4);
+  FAR struct iw_encode_ext *ext = (FAR struct iw_encode_ext *)kbuf;
+  struct socket s;
+  struct iwreq  iwr;
+  int ret;
+
+  ret = wifi_sock(&s);
+  if (ret < 0) return ret;
+
+  /* WPA2 is a *minimum*: WPA2/WPA3 mixed and WPA3-SAE APs also match. */
+
+  ret = wifi_set_auth(&s, IW_AUTH_WPA_VERSION,
+                      plen ? IW_AUTH_WPA_VERSION_WPA2
+                           : IW_AUTH_WPA_VERSION_DISABLED);
+  if (ret >= 0)
+    ret = wifi_set_auth(&s, IW_AUTH_CIPHER_PAIRWISE,
+                        plen ? IW_AUTH_CIPHER_CCMP : IW_AUTH_CIPHER_NONE);
+
+  if (ret >= 0)
+    {
+      memset(kbuf, 0, sizeof(kbuf));
+      ext->alg     = plen ? IW_ENCODE_ALG_CCMP : IW_ENCODE_ALG_NONE;
+      ext->key_len = (uint16_t)plen;
+      memcpy(ext->key, pass, plen);
+
+      memset(&iwr, 0, sizeof(iwr));
+      wifi_ifname(iwr.ifr_name);
+      iwr.u.encoding.pointer = ext;
+      iwr.u.encoding.length  = (uint16_t)(sizeof(*ext) + plen);
+      ret = psock_ioctl(&s, SIOCSIWENCODEEXT, (unsigned long)(uintptr_t)&iwr);
+      memset(kbuf, 0, sizeof(kbuf));                  /* wipe key copy */
+    }
+
+  if (ret >= 0)
+    {
+      memset(&iwr, 0, sizeof(iwr));
+      wifi_ifname(iwr.ifr_name);
+      iwr.u.essid.pointer = (FAR void *)ssid;
+      iwr.u.essid.length  = (uint16_t)strlen(ssid);
+      iwr.u.essid.flags   = IW_ESSID_ON;              /* set + connect */
+      ret = psock_ioctl(&s, SIOCSIWESSID, (unsigned long)(uintptr_t)&iwr);
+    }
+
+  psock_close(&s);
+  return ret;
+}
+
+static char g_wifi_join_ssid[24];
+
+static void wifi_connecting_compose(void)
+{
+  bg_compose(); statusbar_compose();
+  gfx_fill_round(20, 44, 200, 48, 10, COL_SEL_BG);
+  gfx_round(20, 44, 200, 48, 10, COL_ACCENT);
+  gfx_wifi_glyph(42, 76, 3, COL_ACCENT, COL_DIM);
+  gtext(62, 50, "Connecting", COL_SEL_FG);
+  gtext(62, 68, g_wifi_join_ssid, COL_FG);
+}
+
+static void wifi_connect(FAR struct wifi_ui_s *w)
+{
+  FAR const struct wifi_ap_s *ap = &w->ap[w->sel];
+  char line[48];
+  int  ret;
+
+  w->msg[0] = '\0';
+  if (w->passlen > 0 && w->passlen < 8)
+    {
+      strlcpy(w->msg, "need 8..63 chars", sizeof(w->msg));
+      wifi_render();
+      return;
+    }
+
+  snprintf(g_wifi_join_ssid, sizeof(g_wifi_join_ssid), "%.22s", ap->ssid);
+  ui_render(wifi_connecting_compose);
+
+  ret = wifi_join(ap->ssid, w->pass, w->passlen);
+  memset(w->pass, 0, sizeof(w->pass));
+  w->passlen = 0;
+
+  if (ret < 0)
+    {
+      w->state = WIFI_ST_LIST;
+      wifi_status_refresh(w);
+      snprintf(w->msg, sizeof(w->msg), "join failed (%d)", ret);
+      wifi_render();
+      return;
+    }
+
+  /* Associated.  Get an address with the stock DHCP client in the
+   * terminal so the user sees the result.  No secrets are typed there.
+   */
+
+  snprintf(line, sizeof(line), "[wifi] joined %.22s\r\n", ap->ssid);
+  wifi_free();                                   /* w, ap invalid now */
+  ui_enter_mode(UI_MODE_TERMINAL);
+  kbd_echo_str(line);
+  ringdev_puts(&g_kbd_ring, "renew " WIFI_IFNAME "\n");
+}
+
+static void wifi_handle(int navkey, char ch, char base)
+{
+  FAR struct wifi_ui_s *w = g_wifi;
+  if (w == NULL) return;
+
+  if (w->state == WIFI_ST_LIST)
+    {
+      if (navkey == NAV_NONE && (base == 'i' || base == ';')) navkey = NAV_UP;
+      if (navkey == NAV_NONE && (base == 'k' || base == '.')) navkey = NAV_DOWN;
+
+      if (navkey == NAV_UP && w->nap)
+        w->sel = (w->sel + w->nap - 1) % w->nap;
+      else if (navkey == NAV_DOWN && w->nap)
+        w->sel = (w->sel + 1) % w->nap;
+      else if (ch == 's' || ch == 'S')
+        { wifi_scan(w); return; }
+      else if (ch == 'r' || ch == 'R')
+        wifi_status_refresh(w);
+      else if ((ch == '\r' || ch == '\n') && w->nap)
+        {
+          w->state = WIFI_ST_PASS;
+          w->passlen = 0; w->pass[0] = '\0';
+          w->show_pass = false; w->msg[0] = '\0';
+        }
+      else
+        return;
+
+      if (w->sel < w->top) w->top = w->sel;
+      if (w->sel >= w->top + WIFI_VISIBLE) w->top = w->sel - WIFI_VISIBLE + 1;
+      wifi_render();
+      return;
+    }
+
+  /* WIFI_ST_PASS */
+
+  if (navkey == NAV_LEFT)
+    {
+      memset(w->pass, 0, sizeof(w->pass));
+      w->passlen = 0; w->state = WIFI_ST_LIST; w->msg[0] = '\0';
+    }
+  else if (navkey != NAV_NONE)
+    {
+      return;
+    }
+  else if (ch == '\r' || ch == '\n')
+    {
+      wifi_connect(w);
+      return;
+    }
+  else if (ch == (char)KEY_BACKSPACE)
+    {
+      if (w->passlen) w->pass[--w->passlen] = '\0';
+    }
+  else if (ch == '\t')
+    {
+      w->show_pass = !w->show_pass;
+    }
+  else if (ch >= 0x20 && (uint8_t)ch < 0x7f && w->passlen < WIFI_PASS_MAX)
+    {
+      w->pass[w->passlen++] = ch;
+      w->pass[w->passlen] = '\0';
+    }
+  else
+    {
+      return;
+    }
+
+  ui_render_rows(wifi_compose, 46, 118);
+}
+
+static void wifi_tick(void)
+{
+  FAR struct wifi_ui_s *w = g_wifi;
+  if (w == NULL || w->state != WIFI_ST_LIST) return;
+  wifi_status_refresh(w);
+  ui_render_rows(wifi_compose, 16, 51);                /* status card */
+}
+
+#endif /* CARDPUTER_WIFI */
 
 /****************************************************************************
  * Mode switch
  ****************************************************************************/
 
+static void ui_leave_mode(int mode)
+{
+#ifdef CARDPUTER_WIFI
+  if (mode == UI_MODE_WIFI) wifi_free();
+#else
+  UNUSED(mode);
+#endif
+}
+
 static void ui_enter_mode(int mode)
 {
+  ui_leave_mode(g_ui_mode);
   g_ui_mode = mode;
   switch (mode)
     {
       case UI_MODE_SCREENTEST:
-        g_st_color_idx=0; screentest_render(); break;
+        g_st_color_idx=0; ui_render(screentest_compose); break;
       case UI_MODE_KEYBOARDTEST:
         keyboardtest_enter(); break;
       case UI_MODE_FILEMANAGER:
         filemanager_enter(); break;
       case UI_MODE_BATTERY:
-        battery_enter(); break;
+        battery_render(); break;
+#ifdef CARDPUTER_WIFI
+      case UI_MODE_WIFI:
+        wifi_enter(); break;
+#endif
       case UI_MODE_TERMINAL:
         con_clear(); statusbar_render();
         ringdev_putc(&g_kbd_ring,'\n'); break;
@@ -1592,6 +2441,7 @@ static void ui_enter_mode(int mode)
 
 static void ui_back_to_menu(void)
 {
+  ui_leave_mode(g_ui_mode);
   g_ui_mode = UI_MODE_MENU;
   g_scroll_offset = 0;
   menu_render();
@@ -1599,57 +2449,30 @@ static void ui_back_to_menu(void)
 
 static void menu_handle(int navkey, char ch)
 {
-  if      (navkey==NAV_UP)         { g_menu_sel=(g_menu_sel+MENU_COUNT-1)%MENU_COUNT; menu_render(); }
-  else if (navkey==NAV_DOWN)       { g_menu_sel=(g_menu_sel+1)%MENU_COUNT; menu_render(); }
-  else if (ch=='\r'||ch=='\n')
-    {
-      switch (g_menu_sel)
-        {
-          case 0: ui_enter_mode(UI_MODE_SCREENTEST);   break;
-          case 1: ui_enter_mode(UI_MODE_KEYBOARDTEST); break;
-          case 2: ui_enter_mode(UI_MODE_TERMINAL);     break;
-          case 3: ui_enter_mode(UI_MODE_FILEMANAGER);  break;
-          case 4: ui_enter_mode(UI_MODE_BATTERY);      break;
-          default: break;
-        }
-    }
+  if      (navkey==NAV_UP)   { g_menu_sel=(g_menu_sel+MENU_COUNT-1)%MENU_COUNT; menu_render(); }
+  else if (navkey==NAV_DOWN) { g_menu_sel=(g_menu_sel+1)%MENU_COUNT; menu_render(); }
+  else if (ch=='\r'||ch=='\n') ui_enter_mode(g_menu_items[g_menu_sel].mode);
 }
 
 /****************************************************************************
  * kbd_nsh_thread
- *
- * Key decode rules
- * ----------------
- * Step 1 – modifier latches (shift/ctrl/fn) are processed for every event
- *          regardless of mode.
- *
- * Step 2 – navkey decode:
- *   fn pressed  →  i/;=UP  k/.=DOWN  j=LEFT  l=RIGHT
- *   fn absent   →  navkey stays NAV_NONE; ch is decoded from key map
- *
- * Step 3 – mode dispatch:
- *
- *   UI_MODE_MENU
- *       navkey UP/DOWN   → menu navigate  (works with OR without fn)
- *       ch ENTER         → select
- *
- *   UI_MODE_TERMINAL
- *       fn+UP            → term_scroll_up()
- *       fn+DOWN          → term_scroll_down()
- *       UP/DOWN/L/R      → VT100 escape (snap first)
- *       ch               → snap + send to shell
- *
- *   UI_MODE_SCREENTEST
- *       navkey UP/DOWN   → cycle colours (no fn needed, matches original)
- *
- *   UI_MODE_KEYBOARDTEST / FILEMANAGER / BATTERY
- *       unchanged
  ****************************************************************************/
 
-static void kbd_send_vt100(const char *seq)
-{ for (;*seq;seq++) ringdev_putc(&g_kbd_ring,*seq); }
-
+static void kbd_send_vt100(FAR const char *seq) { ringdev_puts(&g_kbd_ring, seq); }
 static void kbd_echo(char c) { ringdev_tryputc(&g_out_ring,c); }
+static void kbd_echo_str(FAR const char *s) { for (; *s; s++) kbd_echo(*s); }
+
+static inline uint32_t uptime_ms(void)
+{
+  return (uint32_t)TICK2MSEC(clock_systime_ticks());
+}
+
+static inline int nav_from_base(char base)
+{
+  if (base=='i'||base==';') return NAV_UP;
+  if (base=='k'||base=='.') return NAV_DOWN;
+  return NAV_NONE;
+}
 
 static int kbd_nsh_thread(int argc, FAR char *argv[])
 {
@@ -1657,13 +2480,16 @@ static int kbd_nsh_thread(int argc, FAR char *argv[])
   bool shift_pressed=false, ctrl_pressed=false, fn_pressed=false;
 
 #define KBD_COOLDOWN_MS 100
-  uint32_t last_key_ms=0, g_uptime_ms=0;
+#define KBD_POLL_US     20000
+  uint32_t last_key_ms=0;
   uint8_t  last_key_raw=0;
-  uint32_t bar_last_ms=0, bat_last_ms=0;
+  uint32_t bar_last_ms=0, bat_last_ms=0, wifi_last_ms=0;
+
+  UNUSED(argc); UNUSED(argv);
 
   esp_configgpio(44,OUTPUT); esp_gpiowrite(44,1);
   esp_configgpio(11,INPUT|PULLUP);
-  up_mdelay(300);
+  usleep(300 * 1000);
 
   if (!soft_tca8418_write(0x01,0x80)) return -ENODEV;
   soft_tca8418_write(0x11,0xFF); soft_tca8418_write(0x12,0xFF);
@@ -1677,188 +2503,148 @@ static int kbd_nsh_thread(int argc, FAR char *argv[])
 
   while (1)
     {
-      g_uptime_ms += 20;
+      uint32_t now = uptime_ms();
 
       if (soft_tca8418_read(0x03,&reg_val))
         {
           uint8_t event_count = reg_val & 0x0F;
 
-          while (event_count > 0)
+          for (; event_count > 0; event_count--)
             {
-              if (!soft_tca8418_read(0x04,&reg_val))
-                { event_count--; continue; }
+              if (!soft_tca8418_read(0x04,&reg_val)) continue;
 
               bool    is_pressed = (reg_val & 0x80) != 0;
               uint8_t raw_id     = reg_val & 0x7F;
-              if (raw_id==0) { event_count--; continue; }
+              if (raw_id==0) continue;
 
-              uint8_t buf_id=raw_id-1, raw_row=0, raw_col=buf_id;
-              while (raw_col>=10) { raw_col-=10; raw_row++; }
+              uint8_t buf_id=raw_id-1;
+              uint8_t raw_row=buf_id/10, raw_col=buf_id%10;
               uint8_t mapped_col=(uint8_t)(raw_row<<1);
               if (raw_col>3) mapped_col++;
               uint8_t mapped_row=(uint8_t)((raw_col+4)&3);
-              if (mapped_col>=14||mapped_row>=4) { event_count--; continue; }
+              if (mapped_col>=14||mapped_row>=4) continue;
 
-              uint8_t id=(uint8_t)g_key_map[mapped_row][mapped_col].value_first;
+              FAR const struct KeyValue_t *kv=&g_key_map[mapped_row][mapped_col];
+              char    base=kv->value_first;
+              uint8_t id=(uint8_t)base;
 
               /* --- Modifier latches --- */
-              if (id==KEY_LEFT_SHIFT) { shift_pressed=is_pressed; event_count--; continue; }
-              if (id==KEY_LEFT_CTRL)  { ctrl_pressed =is_pressed; event_count--; continue; }
-              if (id==KEY_FN)         { fn_pressed   =is_pressed; event_count--; continue; }
-              if (id==(uint8_t)KEY_OPT) { if (is_pressed) ui_back_to_menu(); event_count--; continue; }
-              if (id==KEY_LEFT_ALT)   { event_count--; continue; }
-              if (!is_pressed)        { event_count--; continue; }
+              if (id==KEY_LEFT_SHIFT) { shift_pressed=is_pressed; continue; }
+              if (id==KEY_LEFT_CTRL)  { ctrl_pressed =is_pressed; continue; }
+              if (id==KEY_FN)         { fn_pressed   =is_pressed; continue; }
+              if (id==(uint8_t)KEY_OPT) { if (is_pressed) ui_back_to_menu(); continue; }
+              if (id==KEY_LEFT_ALT || !is_pressed) continue;
 
-              /* --- Cooldown --- */
-              if (raw_id==last_key_raw &&
-                  (g_uptime_ms-last_key_ms)<KBD_COOLDOWN_MS)
-                { event_count--; continue; }
-              last_key_ms=g_uptime_ms; last_key_raw=raw_id;
+              /* --- Cooldown (same key within 100 ms) --- */
+              if (raw_id==last_key_raw && (now-last_key_ms)<KBD_COOLDOWN_MS)
+                continue;
+              last_key_ms=now; last_key_raw=raw_id;
 
-              /* --- Decode navkey (fn-layer) and/or character --- */
+              /* --- Decode navkey (fn layer) and/or character --- */
               int  navkey = NAV_NONE;
               char ch     = 0;
 
               if (fn_pressed)
                 {
-                  /* fn held: decode navigation layer */
-                  char base = g_key_map[mapped_row][mapped_col].value_first;
                   switch (base)
                     {
                       case 'i': case ';': navkey=NAV_UP;    break;
                       case 'k': case '.': navkey=NAV_DOWN;  break;
                       case 'j':           navkey=NAV_LEFT;  break;
                       case 'l':           navkey=NAV_RIGHT; break;
-                      default:
-                        /* fn + non-arrow: decode as character normally */
-                        if (ctrl_pressed)
-                          {
-                            if (base>='a'&&base<='z') ch=(char)(base-'a'+1);
-                            else if (base>='A'&&base<='Z') ch=(char)(base-'A'+1);
-                            else ch=base;
-                          }
-                        else
-                          ch=shift_pressed
-                             ? g_key_map[mapped_row][mapped_col].value_second
-                             : base;
-                        if ((uint8_t)ch>=0x80) { event_count--; continue; }
-                        break;
+                      default: break;
                     }
                 }
-              else
+
+              if (navkey==NAV_NONE)
                 {
-                  /* No fn: decode character layer */
                   if (ctrl_pressed)
-                    {
-                      char base=g_key_map[mapped_row][mapped_col].value_first;
-                      if (base>='a'&&base<='z') ch=(char)(base-'a'+1);
-                      else if (base>='A'&&base<='Z') ch=(char)(base-'A'+1);
-                      else ch=base;
-                    }
+                    ch=(base>='a'&&base<='z') ? (char)(base-'a'+1) : base;
                   else
-                    ch=shift_pressed
-                       ? g_key_map[mapped_row][mapped_col].value_second
-                       : g_key_map[mapped_row][mapped_col].value_first;
-                  if ((uint8_t)ch>=0x80) { event_count--; continue; }
+                    ch=shift_pressed ? kv->value_second : base;
+                  if ((uint8_t)ch>=0x80) continue;
                 }
 
               /* --- Mode dispatch --- */
               switch (g_ui_mode)
                 {
-                  /* ---- MENU ---- */
                   case UI_MODE_MENU:
-                    /*
-                     * UP/DOWN work with or without fn.
-                     * navkey is set by both fn-layer and (when fn absent) we
-                     * synthesise it from ch below so the branch is uniform.
-                     */
-                    if (navkey==NAV_NONE)
-                      {
-                        /* no fn: derive navkey from raw id for the two
-                           physical arrow positions (i/k when fn not held) */
-                        char base=g_key_map[mapped_row][mapped_col].value_first;
-                        if (base=='i'||base==';') navkey=NAV_UP;
-                        else if (base=='k'||base=='.') navkey=NAV_DOWN;
-                      }
+                    if (navkey==NAV_NONE) navkey=nav_from_base(base);
                     menu_handle(navkey, ch);
                     break;
 
-                  /* ---- TERMINAL ---- */
                   case UI_MODE_TERMINAL:
-                    if (fn_pressed && navkey==NAV_UP)
-                      { term_scroll_up(); }
-                    else if (fn_pressed && navkey==NAV_DOWN)
-                      { term_scroll_down(); }
+                    if (fn_pressed && navkey==NAV_UP)        term_scroll_up();
+                    else if (fn_pressed && navkey==NAV_DOWN) term_scroll_down();
                     else
                       {
-                        term_snap_live();   /* snap on any non-scroll key */
+                        term_snap_live();
                         if      (navkey==NAV_UP)    kbd_send_vt100("\x1b[A");
                         else if (navkey==NAV_DOWN)  kbd_send_vt100("\x1b[B");
                         else if (navkey==NAV_LEFT)  kbd_send_vt100("\x1b[D");
                         else if (navkey==NAV_RIGHT) kbd_send_vt100("\x1b[C");
-                        else if (ch=='\r'||ch==KEY_ENTER)
+                        else if (ch=='\r')
                           { kbd_echo('\r'); kbd_echo('\n'); ringdev_putc(&g_kbd_ring,'\n'); }
-                        else if (ch==KEY_BACKSPACE)
-                          ringdev_putc(&g_kbd_ring,KEY_BACKSPACE);
-                        else if (ch=='\t')
-                          ringdev_putc(&g_kbd_ring,ch);
-                        else if ((uint8_t)ch<0x20&&ch!=0)
+                        else if (ch==(char)KEY_BACKSPACE || ch=='\t' ||
+                                 ((uint8_t)ch<0x20 && ch!=0))
                           ringdev_putc(&g_kbd_ring,ch);
                         else if (ch!=0)
                           { kbd_echo(ch); ringdev_putc(&g_kbd_ring,ch); }
                       }
                     break;
 
-                  /* ---- SCREENTEST ---- */
                   case UI_MODE_SCREENTEST:
-                    /* UP/DOWN work without fn (navkey may be NAV_NONE if fn absent) */
-                    if (navkey==NAV_NONE)
-                      {
-                        char base=g_key_map[mapped_row][mapped_col].value_first;
-                        if (base=='i'||base==';') navkey=NAV_UP;
-                        else if (base=='k'||base=='.') navkey=NAV_DOWN;
-                      }
+                    if (navkey==NAV_NONE) navkey=nav_from_base(base);
                     screentest_handle(navkey);
                     break;
 
-                  /* ---- KEYBOARD TEST ---- */
                   case UI_MODE_KEYBOARDTEST:
                     keyboardtest_show(ch,raw_id,navkey,
                                       shift_pressed,ctrl_pressed,fn_pressed);
                     break;
 
-                  /* ---- FILE MANAGER ---- */
                   case UI_MODE_FILEMANAGER:
-                    if (navkey==NAV_NONE)
-                      {
-                        char base=g_key_map[mapped_row][mapped_col].value_first;
-                        if (base=='i'||base==';') navkey=NAV_UP;
-                        else if (base=='k'||base=='.') navkey=NAV_DOWN;
-                      }
+                    if (navkey==NAV_NONE) navkey=nav_from_base(base);
                     filemanager_handle(navkey,ch);
                     break;
+
+#ifdef CARDPUTER_WIFI
+                  case UI_MODE_WIFI:
+                    wifi_handle(navkey, ch, base);
+                    break;
+#endif
 
                   case UI_MODE_BATTERY:
                   default: break;
                 }
-
-              event_count--;
             }
 
           soft_tca8418_write(0x02,0x0F);
         }
 
-      /* Periodic status bar tick — skip while scroll indicator is shown */
-      if (g_ui_mode != UI_MODE_SCREENTEST &&
-          g_scroll_offset == 0 &&
-          (g_uptime_ms-bar_last_ms) >= 2000)
-        { bar_last_ms=g_uptime_ms; statusbar_render(); }
+      /* --- Periodic work --- */
 
-      if (g_ui_mode==UI_MODE_BATTERY &&
-          (g_uptime_ms-bat_last_ms) >= 1000)
-        { bat_last_ms=g_uptime_ms; battery_render(); }
+      now = uptime_ms();
 
-      up_mdelay(20);
+      if ((now-bar_last_ms) >= 2000)
+        {
+          bar_last_ms=now;
+          battery_refresh();
+          if (g_ui_mode != UI_MODE_SCREENTEST && g_scroll_offset == 0)
+            statusbar_render();
+        }
+
+      if (g_ui_mode==UI_MODE_BATTERY && (now-bat_last_ms) >= 1000)
+        { bat_last_ms=now; battery_render(); }
+
+#ifdef CARDPUTER_WIFI
+      if (g_ui_mode==UI_MODE_WIFI && (now-wifi_last_ms) >= WIFI_STATUS_MS)
+        { wifi_last_ms=now; wifi_tick(); }
+#else
+      UNUSED(wifi_last_ms);
+#endif
+
+      usleep(KBD_POLL_US);       /* sleep — do NOT busy-wait (up_mdelay) */
     }
 
   return OK;
@@ -1867,17 +2653,9 @@ static int kbd_nsh_thread(int argc, FAR char *argv[])
 /****************************************************************************
  * lcd_cons_thread — VT100 parser → scrollback
  *
- * Supported escape sequences:
- *   ESC [ n J   erase display
- *   ESC [ n H   cursor home (treated as erase)
- *   ESC [ n K   erase to end of line
- *   ESC [ n A   cursor up   n  (moves scrollback write-pointer)
- *   ESC [ n B   cursor down n
- *   ESC [ n C   cursor right n (column move)
- *   ESC [ n D   cursor left  n
- *   0x0C (FF)   clear screen
- *
- * Colour SGR sequences (ESC [ … m) are silently consumed.
+ *   ESC [ n J / H  erase display     ESC [ n K  erase to end of line
+ *   ESC [ n A / B  cursor up / down  ESC [ n C / D  cursor right / left
+ *   0x0C (FF)      clear screen      ESC [ … m  SGR (ignored)
  ****************************************************************************/
 
 #define ANSI_ESC     0x1b
@@ -1889,6 +2667,9 @@ static int lcd_cons_thread(int argc, FAR char *argv[])
   int     ansi_len  = 0;
   bool    in_escape = false;
 
+  UNUSED(argc); UNUSED(argv);
+
+  battery_refresh();
   con_clear_full();
   menu_render();
 
@@ -1918,46 +2699,39 @@ static int lcd_cons_thread(int argc, FAR char *argv[])
 
                   case 'K':
                     nxmutex_lock(&g_con_mutex);
-                    for (int col=g_sb_col; col<COLS; col++)
-                      { SB_CH(g_sb_total,col)=' '; SB_COL(g_sb_total,col)=COL_FG; }
-                    if (g_scroll_offset==0)
-                      {
-                        sb_paint_row_locked(sb_live_view_row());
-                        gfx_flush_row(sb_live_text_row());
-                      }
+                    if (g_sb_col < COLS)
+                      memset(&SB_CH(g_sb_total, g_sb_col), ' ', COLS - g_sb_col);
+                    if (g_scroll_offset==0) term_flush_live_locked();
                     nxmutex_unlock(&g_con_mutex);
                     break;
 
-                  case 'D':   /* cursor left */
+                  case 'D':
                     nxmutex_lock(&g_con_mutex);
-                    for (int i=0;i<arg;i++) if (g_sb_col>0) g_sb_col--;
+                    g_sb_col = (g_sb_col > arg) ? g_sb_col - arg : 0;
                     nxmutex_unlock(&g_con_mutex);
                     break;
 
-                  case 'C':   /* cursor right */
+                  case 'C':
                     nxmutex_lock(&g_con_mutex);
-                    for (int i=0;i<arg;i++) if (g_sb_col<COLS-1) g_sb_col++;
+                    g_sb_col += arg;
+                    if (g_sb_col > COLS-1) g_sb_col = COLS-1;
                     nxmutex_unlock(&g_con_mutex);
                     break;
 
-                  case 'A':   /* cursor up — retract write pointer */
+                  case 'A':
                     nxmutex_lock(&g_con_mutex);
-                    for (int i=0;i<arg;i++) if (g_sb_total>0) g_sb_total--;
+                    g_sb_total = (g_sb_total > arg) ? g_sb_total - arg : 0;
                     g_sb_col=0;
                     nxmutex_unlock(&g_con_mutex);
                     break;
 
-                  case 'B':   /* cursor down */
+                  case 'B':
                     nxmutex_lock(&g_con_mutex);
-                    for (int i=0;i<arg;i++)
-                      { sb_newline_locked(); }
+                    for (int i=0;i<arg;i++) sb_newline_locked();
                     nxmutex_unlock(&g_con_mutex);
                     break;
 
-                  case 'm':   /* SGR colour — ignore */
-                    break;
-
-                  default: break;
+                  default: break;          /* 'm' (SGR) and others */
                 }
               ansi_len=0;
             }
@@ -1968,7 +2742,7 @@ static int lcd_cons_thread(int argc, FAR char *argv[])
         { in_escape=true; ansi_len=0; ansi_buf[ansi_len++]=(uint8_t)c; continue; }
       if (c==0x0c) { con_clear(); continue; }
 
-      con_putc(c, COL_FG);
+      con_putc(c);
     }
 
   return OK;
@@ -2023,16 +2797,28 @@ int esp32s3_bringup(void)
   if (ret<0) syslog(LOG_ERR,"board_spiflash_init failed: %d\n",ret);
 #endif
 
+  /* Wi-Fi first: esp_wifi_init() wants a large contiguous heap block, which
+   * is easiest to get before the rest of the system starts allocating.
+   */
+
+#ifdef CONFIG_ESPRESSIF_WIFI
+  ret=board_wlan_init();
+  if (ret<0) syslog(LOG_ERR,"board_wlan_init failed: %d\n",ret);
+#endif
+
 #if defined(CONFIG_LCD)
   ret=board_lcd_initialize();
   if (ret<0) return ret;
 
-  ringdev_init(&g_kbd_ring);
-  ringdev_init(&g_out_ring);
+  ringdev_init(&g_kbd_ring, g_kbd_buf, sizeof(g_kbd_buf));
+  ringdev_init(&g_out_ring, g_out_buf, sizeof(g_out_buf));
   g_out_ring_ready=true;
 
 #ifdef CONFIG_SYSLOG
-  syslog_channel_register(&g_lcd_syslog_channel);
+  /* Needs CONFIG_SYSLOG_MAX_CHANNELS >= 2 to coexist with the console. */
+
+  if (syslog_channel_register(&g_lcd_syslog_channel) < 0)
+    syslog(LOG_WARNING,"LCD syslog mirror not registered\n");
 #endif
 
 #if defined(CONFIG_ESPRESSIF_ADC)||defined(CONFIG_ESP32S3_ADC)
@@ -2045,13 +2831,13 @@ int esp32s3_bringup(void)
   ret=register_driver("/dev/cardputer_out",&g_out_ops,0666,&g_out_ring);
   if (ret<0) return ret;
 
-  kthread_create("lcd_cons",110,4096,lcd_cons_thread,NULL);
-  kthread_create("kbd_nsh", 100,4096,kbd_nsh_thread, NULL);
+  kthread_create("lcd_cons",110,CARDPUTER_LCDCONS_STACK,lcd_cons_thread,NULL);
+  kthread_create("kbd_nsh", 100,CARDPUTER_KBD_STACK,   kbd_nsh_thread, NULL);
 #endif
 
   UNUSED(ret);
   return OK;
 }
 
-struct lcd_dev_s *board_lcd_getdev(int lcddev) { return g_lcddev; }
-int up_fbinitialize(int display)               { return OK; }
+struct lcd_dev_s *board_lcd_getdev(int lcddev) { UNUSED(lcddev); return g_lcddev; }
+int up_fbinitialize(int display)               { UNUSED(display); return OK; }
