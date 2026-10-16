@@ -248,7 +248,8 @@ networks, strongest first, duplicates and hidden SSIDs removed.
 | **s** | Scan for networks (takes a couple of seconds) |
 | **r** | Refresh link status |
 | **UP / DOWN** | Select a network (`i`/`;` and `k`/`.` work without `fn`) |
-| **ENTER** | Open the passphrase prompt for the selected network |
+| **ENTER** | Join: saved networks connect at once, others open the passphrase prompt |
+| **f** | Forget the selected saved network |
 
 In the passphrase prompt:
 
@@ -259,6 +260,16 @@ In the passphrase prompt:
 | **BACKSPACE** | Delete |
 | **ENTER** | Connect |
 | `fn` + `j` | Back to the list |
+
+**Saved networks.** After a successful join the passphrase is stored in the
+last 4 KB sector of the SPI flash (up to 4 networks, most recent first,
+CRC‑checked; a failed join is never saved). Saved networks show a dot in the
+scan list. At boot a one‑shot background task tries the saved networks,
+runs `renew wlan0` and, once it has an address, sets the clock over NTP —
+so after a reboot Wi‑Fi and the time come back by themselves. If a saved
+passphrase stops working, the prompt opens so you can type the new one.
+Passphrases are stored in plain text: anyone with the device and `esptool`
+can read them back.
 
 On success the firmware switches to the **Terminal** and runs
 `renew wlan0`, so you can watch the DHCP lease arrive. The passphrase is

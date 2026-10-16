@@ -110,6 +110,19 @@
 #  endif
 #endif
 
+/* Saved Wi-Fi networks live in a raw 4 KB flash sector (no filesystem, so
+ * no FS caches in RAM).  Needs the ESP SPI-flash MTD driver; disabled for
+ * MCUboot images, whose partition layout may use the end of flash.
+ */
+
+#if defined(CARDPUTER_WIFI) && defined(CONFIG_ESPRESSIF_MTD) && \
+    defined(CONFIG_MTD_PARTITION) && !defined(CONFIG_ESPRESSIF_BOOTLOADER_MCUBOOT)
+#  define CARDPUTER_WIFI_STORE 1
+#  include <nuttx/mtd/mtd.h>
+FAR struct mtd_dev_s *esp_spiflash_alloc_mtdpart(uint32_t mtd_offset,
+                                                 uint32_t mtd_size);
+#endif
+
 /****************************************************************************
  * Tunables  (override with -D or edit here)
  ****************************************************************************/
@@ -2013,6 +2026,7 @@ struct wifi_ap_s
   char    ssid[IW_ESSID_MAX_SIZE + 1];
   int8_t  rssi;
   uint8_t chan;
+  uint8_t saved;                             /* passphrase in flash */
 };
 
 struct wifi_ui_s
@@ -2279,6 +2293,262 @@ static int wifi_do_scan(FAR struct wifi_ui_s *w)
   return ret < 0 ? ret : w->nap;
 }
 
+/* --- saved networks (flash) --------------------------------------------- */
+
+#ifdef CARDPUTER_WIFI_STORE
+
+#if defined(CONFIG_ESP32S3_FLASH_32M) || defined(CONFIG_ESPRESSIF_FLASH_32M)
+#  define WSTORE_FLASH_BYTES 0x2000000
+#elif defined(CONFIG_ESP32S3_FLASH_16M) || defined(CONFIG_ESPRESSIF_FLASH_16M)
+#  define WSTORE_FLASH_BYTES 0x1000000
+#elif defined(CONFIG_ESP32S3_FLASH_8M) || defined(CONFIG_ESPRESSIF_FLASH_8M)
+#  define WSTORE_FLASH_BYTES 0x800000
+#else
+#  define WSTORE_FLASH_BYTES 0x400000
+#endif
+
+#ifndef CARDPUTER_WIFI_STORE_OFFSET           /* last 4 KB sector */
+#  define CARDPUTER_WIFI_STORE_OFFSET (WSTORE_FLASH_BYTES - 0x1000)
+#endif
+
+#define WSTORE_SIZE    0x1000
+#define WSTORE_MAGIC   0x46575043u            /* "CPWF" */
+#define WSTORE_VERSION 1
+#define WSTORE_MAX     4
+#define WSTORE_IMG     512                    /* bytes read/written */
+
+struct wifi_cred_s
+{
+  char    ssid[IW_ESSID_MAX_SIZE + 1];
+  uint8_t passlen;
+  char    pass[WIFI_PASS_MAX + 1];
+};
+
+struct wifi_store_s
+{
+  uint32_t magic;
+  uint16_t version;
+  uint16_t count;
+  struct wifi_cred_s net[WSTORE_MAX];       /* [0] = most recently used */
+  uint32_t crc;
+};
+
+static FAR struct mtd_dev_s *g_wstore_mtd;
+
+static uint32_t wstore_crc(FAR const void *data, size_t len)
+{
+  FAR const uint8_t *p = data;
+  uint32_t crc = 0xffffffffu;
+  while (len--)
+    {
+      crc ^= *p++;
+      for (int k = 0; k < 8; k++)
+        crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1)));
+    }
+  return ~crc;
+}
+
+/* Returns the MTD and the block count covering WSTORE_IMG bytes. */
+
+static FAR struct mtd_dev_s *wstore_open(FAR size_t *nblk, FAR size_t *img)
+{
+  struct mtd_geometry_s geo;
+
+  if (g_wstore_mtd == NULL)
+    g_wstore_mtd = esp_spiflash_alloc_mtdpart(CARDPUTER_WIFI_STORE_OFFSET,
+                                              WSTORE_SIZE);
+  if (g_wstore_mtd == NULL) return NULL;
+
+  memset(&geo, 0, sizeof(geo));
+  if (MTD_IOCTL(g_wstore_mtd, MTDIOC_GEOMETRY,
+                (unsigned long)(uintptr_t)&geo) < 0 || geo.blocksize == 0)
+    return NULL;
+
+  *nblk = (WSTORE_IMG + geo.blocksize - 1) / geo.blocksize;
+  *img  = *nblk * geo.blocksize;
+  return g_wstore_mtd;
+}
+
+/* Load into *st (heap, caller frees).  Returns the entry count, 0 when the
+ * sector is blank or fails its checks.
+ */
+
+static int wstore_load(FAR struct wifi_store_s *st)
+{
+  size_t nblk, isz;
+  FAR struct mtd_dev_s *mtd = wstore_open(&nblk, &isz);
+  FAR uint8_t *img;
+  ssize_t n;
+
+  memset(st, 0, sizeof(*st));
+  if (mtd == NULL || (img = kmm_malloc(isz)) == NULL) return 0;
+
+  n = MTD_BREAD(mtd, 0, nblk, img);
+  if (n == (ssize_t)nblk) memcpy(st, img, sizeof(*st));
+  memset(img, 0, isz);
+  kmm_free(img);
+
+  if (st->magic != WSTORE_MAGIC || st->version != WSTORE_VERSION ||
+      st->count > WSTORE_MAX ||
+      st->crc != wstore_crc(st, offsetof(struct wifi_store_s, crc)))
+    {
+      memset(st, 0, sizeof(*st));
+      return 0;
+    }
+
+  for (int i = 0; i < st->count; i++)          /* never trust lengths */
+    {
+      st->net[i].ssid[IW_ESSID_MAX_SIZE] = '\0';
+      if (st->net[i].passlen > WIFI_PASS_MAX) st->net[i].passlen = 0;
+      st->net[i].pass[st->net[i].passlen] = '\0';
+    }
+
+  return st->count;
+}
+
+static int wstore_save(FAR struct wifi_store_s *st)
+{
+  size_t nblk, isz;
+  FAR struct mtd_dev_s *mtd = wstore_open(&nblk, &isz);
+  FAR uint8_t *img;
+  ssize_t n;
+  int ret;
+
+  if (mtd == NULL) return -ENODEV;
+  if ((img = kmm_malloc(isz)) == NULL) return -ENOMEM;
+
+  st->magic   = WSTORE_MAGIC;
+  st->version = WSTORE_VERSION;
+  st->crc     = wstore_crc(st, offsetof(struct wifi_store_s, crc));
+
+  memset(img, 0xff, isz);
+  memcpy(img, st, sizeof(*st));
+
+  ret = MTD_ERASE(mtd, 0, 1);
+  if (ret >= 0)
+    {
+      n = MTD_BWRITE(mtd, 0, nblk, img);
+      ret = (n == (ssize_t)nblk) ? OK : (n < 0 ? (int)n : -EIO);
+    }
+
+  memset(img, 0, isz);
+  kmm_free(img);
+  return ret;
+}
+
+/* Copy the saved passphrase for `ssid` into pass[WIFI_PASS_MAX+1]. */
+
+static bool wstore_find(FAR const char *ssid, FAR char *pass,
+                        FAR uint8_t *plen)
+{
+  FAR struct wifi_store_s *st = kmm_malloc(sizeof(*st));
+  bool found = false;
+
+  if (st == NULL) return false;
+  wstore_load(st);
+  for (int i = 0; i < st->count && !found; i++)
+    if (strcmp(st->net[i].ssid, ssid) == 0)
+      {
+        memcpy(pass, st->net[i].pass, WIFI_PASS_MAX + 1);
+        *plen = st->net[i].passlen;
+        found = true;
+      }
+
+  memset(st, 0, sizeof(*st));
+  kmm_free(st);
+  return found;
+}
+
+/* Put ssid/pass first; keep the other most recent ones.  Writes flash only
+ * when something actually changed (flash sectors wear out).
+ */
+
+static int wstore_remember(FAR const char *ssid, FAR const char *pass,
+                           size_t plen)
+{
+  FAR struct wifi_store_s *st = kmm_malloc(sizeof(*st));
+  struct wifi_cred_s cur;
+  int ret = OK;
+
+  if (st == NULL) return -ENOMEM;
+  wstore_load(st);
+
+  if (st->count > 0 && strcmp(st->net[0].ssid, ssid) == 0 &&
+      st->net[0].passlen == plen && memcmp(st->net[0].pass, pass, plen) == 0)
+    goto out;                                 /* already first, unchanged */
+
+  memset(&cur, 0, sizeof(cur));
+  strlcpy(cur.ssid, ssid, sizeof(cur.ssid));
+  cur.passlen = (uint8_t)plen;
+  memcpy(cur.pass, pass, plen);
+
+  int n = 0;
+  struct wifi_cred_s keep[WSTORE_MAX];
+  for (int i = 0; i < st->count && n < WSTORE_MAX - 1; i++)
+    if (strcmp(st->net[i].ssid, ssid) != 0) keep[n++] = st->net[i];
+
+  st->net[0] = cur;
+  for (int i = 0; i < n; i++) st->net[i + 1] = keep[i];
+  for (int i = n + 1; i < WSTORE_MAX; i++) memset(&st->net[i], 0, sizeof(st->net[i]));
+  st->count = (uint16_t)(n + 1);
+  ret = wstore_save(st);
+
+  memset(keep, 0, sizeof(keep));
+  memset(&cur, 0, sizeof(cur));
+out:
+  memset(st, 0, sizeof(*st));
+  kmm_free(st);
+  return ret;
+}
+
+static int wstore_forget(FAR const char *ssid)
+{
+  FAR struct wifi_store_s *st = kmm_malloc(sizeof(*st));
+  int ret = -ENOENT, n = 0;
+
+  if (st == NULL) return -ENOMEM;
+  wstore_load(st);
+  for (int i = 0; i < st->count; i++)
+    if (strcmp(st->net[i].ssid, ssid) != 0) st->net[n++] = st->net[i];
+
+  if (n != st->count)
+    {
+      for (int i = n; i < WSTORE_MAX; i++) memset(&st->net[i], 0, sizeof(st->net[i]));
+      st->count = (uint16_t)n;
+      ret = wstore_save(st);
+    }
+
+  memset(st, 0, sizeof(*st));
+  kmm_free(st);
+  return ret;
+}
+
+static void wifi_mark_saved(FAR struct wifi_ui_s *w)
+{
+  FAR struct wifi_store_s *st = kmm_malloc(sizeof(*st));
+  if (st == NULL) return;
+  wstore_load(st);
+  for (int a = 0; a < w->nap; a++)
+    {
+      w->ap[a].saved = 0;
+      for (int i = 0; i < st->count; i++)
+        if (strcmp(w->ap[a].ssid, st->net[i].ssid) == 0) w->ap[a].saved = 1;
+    }
+  memset(st, 0, sizeof(*st));
+  kmm_free(st);
+}
+
+#else  /* !CARDPUTER_WIFI_STORE */
+
+static bool wstore_find(FAR const char *s, FAR char *p, FAR uint8_t *l)
+{ UNUSED(s); UNUSED(p); UNUSED(l); return false; }
+static int  wstore_remember(FAR const char *s, FAR const char *p, size_t l)
+{ UNUSED(s); UNUSED(p); UNUSED(l); return -ENOSYS; }
+static int  wstore_forget(FAR const char *s) { UNUSED(s); return -ENOSYS; }
+static void wifi_mark_saved(FAR struct wifi_ui_s *w) { UNUSED(w); }
+
+#endif /* CARDPUTER_WIFI_STORE */
+
 /* --- drawing ------------------------------------------------------------ */
 
 static void wifi_list_compose(FAR struct wifi_ui_s *w)
@@ -2330,8 +2600,9 @@ static void wifi_list_compose(FAR struct wifi_ui_s *w)
         }
       gfx_wifi_glyph(19, y + 12, rssi_bars(ap->rssi),
                      sel ? COL_ACCENT : COL_FG, COL_DIM);
-      snprintf(line, sizeof(line), "%.19s", ap->ssid);
+      snprintf(line, sizeof(line), "%.18s", ap->ssid);
       gtext(32, y, line, sel ? COL_SEL_FG : COL_FG);
+      if (ap->saved) gfx_fill_circle(186, y + 8, 2, COL_ACCENT);   /* saved */
       snprintf(line, sizeof(line), "%d", ap->rssi);
       gtext_right(LCD_W - 10, y, line, COL_DIM);
     }
@@ -2342,7 +2613,7 @@ static void wifi_list_compose(FAR struct wifi_ui_s *w)
       gtext_right(LCD_W - 6, 119, line, COL_DIM);
     }
 
-  footer_compose("s=scan ENTER=join");
+  footer_compose("s=scan ok=join f=forget");
 }
 
 static void wifi_pass_compose(FAR struct wifi_ui_s *w)
@@ -2410,22 +2681,31 @@ static void wifi_render(void) { ui_render(wifi_compose); }
 
 /* Bring wlan0 up if NSH's netinit didn't; report the driver's error. */
 
-static void wifi_ifup(FAR struct wifi_ui_s *w)
+static int wifi_set_up(void)
 {
   struct socket s;
   struct ifreq  ifr;
   int ret;
 
-  if (w->up || wifi_sock(&s) < 0) return;
+  ret = wifi_sock(&s);
+  if (ret < 0) return ret;
   memset(&ifr, 0, sizeof(ifr));
   wifi_ifname(ifr.ifr_name);
-  if (psock_ioctl(&s, SIOCGIFFLAGS, (unsigned long)(uintptr_t)&ifr) >= 0)
+  ret = psock_ioctl(&s, SIOCGIFFLAGS, (unsigned long)(uintptr_t)&ifr);
+  if (ret >= 0 && !(ifr.ifr_flags & IFF_UP))
     {
       ifr.ifr_flags |= IFF_UP;
       ret = psock_ioctl(&s, SIOCSIFFLAGS, (unsigned long)(uintptr_t)&ifr);
-      if (ret < 0) snprintf(w->msg, sizeof(w->msg), "ifup err %d", ret);
     }
   psock_close(&s);
+  return ret;
+}
+
+static void wifi_ifup(FAR struct wifi_ui_s *w)
+{
+  if (w->up) return;
+  int ret = wifi_set_up();
+  if (ret < 0) snprintf(w->msg, sizeof(w->msg), "ifup err %d", ret);
   wifi_status_refresh(w);
 }
 
@@ -2446,6 +2726,7 @@ static void wifi_scan(FAR struct wifi_ui_s *w)
   int ret = wifi_do_scan(w);
   if (ret < 0) snprintf(w->msg, sizeof(w->msg), "scan failed (%d)", ret);
   else         w->msg[0] = '\0';
+  wifi_mark_saved(w);
   wifi_status_refresh(w);
   wifi_render();
 }
@@ -2531,9 +2812,14 @@ static void wifi_connecting_compose(void)
   gtext(62, 68, g_wifi_join_ssid, COL_FG);
 }
 
-static void wifi_connect(FAR struct wifi_ui_s *w)
+/* Join the selected AP with w->pass.  from_saved: the passphrase came from
+ * flash -- on failure drop into the prompt so it can be retyped.
+ * On success the passphrase is (re)saved, then DHCP runs in the terminal.
+ */
+
+static void wifi_connect(FAR struct wifi_ui_s *w, bool from_saved)
 {
-  FAR const struct wifi_ap_s *ap = &w->ap[w->sel];
+  FAR struct wifi_ap_s *ap = &w->ap[w->sel];
   char line[48];
   int  ret;
 
@@ -2549,14 +2835,29 @@ static void wifi_connect(FAR struct wifi_ui_s *w)
   ui_render(wifi_connecting_compose);
 
   ret = wifi_join(ap->ssid, w->pass, w->passlen);
+  if (ret >= 0 && !from_saved)
+    {
+      int sret = wstore_remember(ap->ssid, w->pass, w->passlen);
+      if (sret < 0) syslog(LOG_WARNING, "wifi: save failed %d\n", sret);
+    }
+
   memset(w->pass, 0, sizeof(w->pass));
   w->passlen = 0;
 
   if (ret < 0)
     {
-      w->state = WIFI_ST_LIST;
       wifi_status_refresh(w);
-      snprintf(w->msg, sizeof(w->msg), "join failed (%d)", ret);
+      if (from_saved)
+        {
+          w->state = WIFI_ST_PASS;              /* saved key rejected */
+          w->show_pass = false;
+          snprintf(w->msg, sizeof(w->msg), "saved key failed %d", ret);
+        }
+      else
+        {
+          w->state = WIFI_ST_LIST;
+          snprintf(w->msg, sizeof(w->msg), "join failed (%d)", ret);
+        }
       wifi_render();
       return;
     }
@@ -2592,9 +2893,30 @@ static void wifi_handle(int navkey, char ch, char base)
         wifi_status_refresh(w);
       else if ((ch == '\r' || ch == '\n') && w->nap)
         {
+          w->show_pass = false; w->msg[0] = '\0';
+          if (w->ap[w->sel].saved &&
+              wstore_find(w->ap[w->sel].ssid, w->pass, &w->passlen))
+            {
+              wifi_connect(w, true);            /* no prompt needed */
+              return;
+            }
+
           w->state = WIFI_ST_PASS;
           w->passlen = 0; w->pass[0] = '\0';
-          w->show_pass = false; w->msg[0] = '\0';
+        }
+      else if ((ch == 'f' || ch == 'F') && w->nap && w->ap[w->sel].saved)
+        {
+          int ret = wstore_forget(w->ap[w->sel].ssid);
+          if (ret >= 0)
+            {
+              w->ap[w->sel].saved = 0;
+              snprintf(w->msg, sizeof(w->msg), "forgot %.16s",
+                       w->ap[w->sel].ssid);
+            }
+          else
+            {
+              snprintf(w->msg, sizeof(w->msg), "forget err %d", ret);
+            }
         }
       else
         return;
@@ -2618,7 +2940,7 @@ static void wifi_handle(int navkey, char ch, char base)
     }
   else if (ch == '\r' || ch == '\n')
     {
-      wifi_connect(w);
+      wifi_connect(w, false);
       return;
     }
   else if (ch == (char)KEY_BACKSPACE)
@@ -2780,6 +3102,82 @@ static bool net_link_running(void)
   psock_close(&s);
   return up;
 }
+
+#ifdef CARDPUTER_WIFI_STORE
+
+/* Boot-time auto connect.  Runs once in its own short-lived kernel thread
+ * (stack freed when it returns), so the keyboard stays responsive:
+ *   1. try the saved networks, most recently used first
+ *   2. ask NSH's stock DHCP client for a lease (`renew wlan0`)
+ *   3. once an address arrives, set the clock over NTP
+ */
+
+#ifndef CARDPUTER_WIFI_AUTO_DELAY_MS
+#  define CARDPUTER_WIFI_AUTO_DELAY_MS 3000  /* let NSH + netinit start */
+#endif
+
+static bool wifi_has_lease(void)
+{
+  struct socket s;
+  struct ifreq ifr;
+  uint32_t a = 0;
+
+  if (!net_link_running() || wifi_sock(&s) < 0) return false;
+  memset(&ifr, 0, sizeof(ifr));
+  wifi_ifname(ifr.ifr_name);
+  if (psock_ioctl(&s, SIOCGIFADDR, (unsigned long)(uintptr_t)&ifr) >= 0)
+    a = ntohl(((FAR struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr);
+  psock_close(&s);
+
+#if defined(CONFIG_NETINIT_NETLOCAL) && defined(CONFIG_NETINIT_IPADDR)
+  if (a == (uint32_t)CONFIG_NETINIT_IPADDR) return false;  /* static default */
+#endif
+  return a != 0;
+}
+
+static int wifi_auto_thread(int argc, FAR char *argv[])
+{
+  FAR struct wifi_store_s *st;
+  int ret = -ENOENT;
+
+  UNUSED(argc); UNUSED(argv);
+  usleep(CARDPUTER_WIFI_AUTO_DELAY_MS * 1000);
+
+  st = kmm_malloc(sizeof(*st));
+  if (st == NULL) return -ENOMEM;
+
+  if (wstore_load(st) > 0)
+    {
+      wifi_set_up();
+      for (int i = 0; i < st->count && ret < 0; i++)
+        {
+          ret = wifi_join(st->net[i].ssid, st->net[i].pass,
+                          st->net[i].passlen);
+          syslog(LOG_INFO, "wifi: auto-join %s: %d\n", st->net[i].ssid, ret);
+        }
+    }
+
+  memset(st, 0, sizeof(*st));
+  kmm_free(st);
+  if (ret < 0) return ret;
+
+  ringdev_puts(&g_kbd_ring, "renew " WIFI_IFNAME "\n");
+
+  for (int t = 0; t < 40; t++)                  /* up to 20 s for a lease */
+    {
+      usleep(500 * 1000);
+      if (wifi_has_lease())
+        {
+          g_ntp_state = 2;
+          g_ntp_state = ntp_sync() >= 0 ? 0 : -EIO;
+          break;
+        }
+    }
+
+  return OK;
+}
+
+#endif /* CARDPUTER_WIFI_STORE */
 
 #endif /* CARDPUTER_WIFI */
 
@@ -3353,6 +3751,13 @@ int esp32s3_bringup(void)
 
   kthread_create("lcd_cons",110,CARDPUTER_LCDCONS_STACK,lcd_cons_thread,NULL);
   kthread_create("kbd_nsh", 100,CARDPUTER_KBD_STACK,   kbd_nsh_thread, NULL);
+
+#ifdef CARDPUTER_WIFI_STORE
+  /* One-shot: reconnect to a saved network, DHCP, NTP; then exits. */
+
+  if (g_wlan_init_ret == 0)
+    kthread_create("wifi_auto", 100, 4096, wifi_auto_thread, NULL);
+#endif
 #endif
 
   UNUSED(ret);
