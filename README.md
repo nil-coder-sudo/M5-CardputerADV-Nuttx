@@ -140,6 +140,29 @@ make flash ESPTOOL_PORT=/dev/ttyACM0 ESPTOOL_BAUD=921600
 > looks like `/dev/cu.usbmodemXXXX`. The ESP32‑S3's native USB normally allows
 > auto‑reset, so manual download mode is often unnecessary.
 
+### 5b. (Alternative) Install through M5 Launcher
+
+[M5 Launcher](https://github.com/bmorcelli/Launcher) installs app images into
+its own OTA partitions and starts them with the ESP‑IDF 2nd‑stage
+bootloader, so the image must be built in **legacy IDF format** (the default
+"simple boot" image only runs when flashed at `0x0`):
+
+```bash
+# menuconfig: System Type → Bootloader and Image Configuration →
+#             [*] Enable legacy IDF bootloader format
+# or:
+echo CONFIG_ESP32S3_APP_FORMAT_LEGACY=y >> .config
+make olddefconfig && make -j
+```
+
+Copy the resulting `nuttx.bin` to the SD card and install it from Launcher's
+SD menu. **Do not run `make flash` in this mode** — it writes NuttX's own
+bootloader and partition table and erases Launcher.
+
+Under Launcher the saved Wi‑Fi networks go to the highest flash sector that
+no partition uses; if Launcher has handed out the whole flash, networks are
+not saved and the terminal says `(not saved)`.
+
 ### 6. (Optional) Serial monitor
 
 A serial console is handy for debugging the boot sequence:

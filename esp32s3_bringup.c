@@ -78,6 +78,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -112,7 +113,8 @@
 
 /* Saved Wi-Fi networks live in a raw 4 KB flash sector (no filesystem, so
  * no FS caches in RAM).  Needs the ESP SPI-flash MTD driver; disabled for
- * MCUboot images, whose partition layout may use the end of flash.
+ * MCUboot images.  With a partition table (legacy IDF format, e.g. when
+ * installed by M5 Launcher) only a sector that no partition claims is used.
  */
 
 #if defined(CARDPUTER_WIFI) && defined(CONFIG_ESPRESSIF_MTD) && \
@@ -2307,9 +2309,12 @@ static int wifi_do_scan(FAR struct wifi_ui_s *w)
 #  define WSTORE_FLASH_BYTES 0x400000
 #endif
 
-#ifndef CARDPUTER_WIFI_STORE_OFFSET           /* last 4 KB sector */
-#  define CARDPUTER_WIFI_STORE_OFFSET (WSTORE_FLASH_BYTES - 0x1000)
+#ifdef CONFIG_ESP32S3_PARTITION_TABLE_OFFSET
+#  define WSTORE_PT_OFFSET CONFIG_ESP32S3_PARTITION_TABLE_OFFSET
+#else
+#  define WSTORE_PT_OFFSET 0x8000
 #endif
+#define WSTORE_PT_BYTES  0xc00                /* 96 entries x 32 B */
 
 #define WSTORE_SIZE    0x1000
 #define WSTORE_MAGIC   0x46575043u            /* "CPWF" */
@@ -2334,6 +2339,7 @@ struct wifi_store_s
 };
 
 static FAR struct mtd_dev_s *g_wstore_mtd;
+static uint32_t g_wstore_off;                /* chosen sector, 1 = none */
 
 static uint32_t wstore_crc(FAR const void *data, size_t len)
 {
@@ -2348,15 +2354,82 @@ static uint32_t wstore_crc(FAR const void *data, size_t len)
   return ~crc;
 }
 
+/* Pick the flash sector for the store.
+ *
+ *   No partition table at 0x8000 (simple-boot image: our own code sits
+ *   there) -> the last sector of the chip.
+ *   Partition table present (IDF bootloader / M5 Launcher, which hands the
+ *   free space to other apps and their data partitions) -> the highest
+ *   sector above 0x10000 that no partition covers, or none at all.
+ *   A layout change made later by Launcher can at worst overwrite the
+ *   store, which the CRC then rejects -- it never makes us write into
+ *   someone else's partition, because the table is checked every boot.
+ */
+
+static uint32_t wstore_pick_offset(void)
+{
+  FAR struct mtd_dev_s *pt;
+  struct mtd_geometry_s geo;
+  uint32_t off[24], len[24];
+  FAR uint8_t *tbl;
+  int n = 0;
+
+  pt = esp_spiflash_alloc_mtdpart(WSTORE_PT_OFFSET, 0x1000);
+  memset(&geo, 0, sizeof(geo));
+  if (pt == NULL || MTD_IOCTL(pt, MTDIOC_GEOMETRY,
+                              (unsigned long)(uintptr_t)&geo) < 0 ||
+      geo.blocksize == 0 || (tbl = kmm_malloc(WSTORE_PT_BYTES)) == NULL)
+    return 1;
+
+  if (MTD_BREAD(pt, 0, WSTORE_PT_BYTES / geo.blocksize, tbl) ==
+      (ssize_t)(WSTORE_PT_BYTES / geo.blocksize))
+    {
+      for (int i = 0; i < WSTORE_PT_BYTES && n < 24; i += 32)
+        {
+          FAR const uint8_t *e = tbl + i;
+          if (e[0] != 0xaa || e[1] != 0x50) break;     /* end / MD5 / none */
+          off[n] = e[4] | (e[5] << 8) | (e[6] << 16) | ((uint32_t)e[7] << 24);
+          len[n] = e[8] | (e[9] << 8) | (e[10] << 16) | ((uint32_t)e[11] << 24);
+          n++;
+        }
+    }
+
+  kmm_free(tbl);
+  if (n == 0) return WSTORE_FLASH_BYTES - WSTORE_SIZE;
+
+  for (uint32_t sec = WSTORE_FLASH_BYTES - WSTORE_SIZE; sec >= 0x10000;
+       sec -= WSTORE_SIZE)
+    {
+      bool used = false;
+      for (int i = 0; i < n && !used; i++)
+        used = sec < off[i] + len[i] && sec + WSTORE_SIZE > off[i];
+      if (!used) return sec;
+    }
+
+  return 1;                                    /* every sector is taken */
+}
+
 /* Returns the MTD and the block count covering WSTORE_IMG bytes. */
 
 static FAR struct mtd_dev_s *wstore_open(FAR size_t *nblk, FAR size_t *img)
 {
   struct mtd_geometry_s geo;
 
-  if (g_wstore_mtd == NULL)
-    g_wstore_mtd = esp_spiflash_alloc_mtdpart(CARDPUTER_WIFI_STORE_OFFSET,
-                                              WSTORE_SIZE);
+  if (g_wstore_off == 0)
+    {
+      g_wstore_off = wstore_pick_offset();
+      if (g_wstore_off != 1)
+        {
+          g_wstore_mtd = esp_spiflash_alloc_mtdpart(g_wstore_off, WSTORE_SIZE);
+          syslog(LOG_INFO, "wifi: credential store at 0x%" PRIx32 "\n",
+                 g_wstore_off);
+        }
+      else
+        {
+          syslog(LOG_WARNING, "wifi: no free flash sector, not saving\n");
+        }
+    }
+
   if (g_wstore_mtd == NULL) return NULL;
 
   memset(&geo, 0, sizeof(geo));
@@ -2414,7 +2487,7 @@ static int wstore_save(FAR struct wifi_store_s *st)
   ssize_t n;
   int ret;
 
-  if (mtd == NULL) return -ENODEV;
+  if (mtd == NULL) return g_wstore_off == 1 ? -ENOSPC : -ENODEV;
   if ((img = kmm_malloc(isz)) == NULL) return -ENOMEM;
 
   st->magic   = WSTORE_MAGIC;
@@ -2820,7 +2893,7 @@ static void wifi_connecting_compose(void)
 static void wifi_connect(FAR struct wifi_ui_s *w, bool from_saved)
 {
   FAR struct wifi_ap_s *ap = &w->ap[w->sel];
-  char line[48];
+  char line[64];
   int  ret;
 
   w->msg[0] = '\0';
@@ -2834,10 +2907,11 @@ static void wifi_connect(FAR struct wifi_ui_s *w, bool from_saved)
   snprintf(g_wifi_join_ssid, sizeof(g_wifi_join_ssid), "%.22s", ap->ssid);
   ui_render(wifi_connecting_compose);
 
+  int sret = 0;
   ret = wifi_join(ap->ssid, w->pass, w->passlen);
   if (ret >= 0 && !from_saved)
     {
-      int sret = wstore_remember(ap->ssid, w->pass, w->passlen);
+      sret = wstore_remember(ap->ssid, w->pass, w->passlen);
       if (sret < 0) syslog(LOG_WARNING, "wifi: save failed %d\n", sret);
     }
 
@@ -2866,7 +2940,8 @@ static void wifi_connect(FAR struct wifi_ui_s *w, bool from_saved)
    * terminal so the user sees the result.  No secrets are typed there.
    */
 
-  snprintf(line, sizeof(line), "[wifi] joined %.22s\r\n", ap->ssid);
+  snprintf(line, sizeof(line), sret < 0 ? "[wifi] joined %.22s (not saved)\r\n"
+                                        : "[wifi] joined %.22s\r\n", ap->ssid);
   wifi_free();                                   /* w, ap invalid now */
   ui_enter_mode(UI_MODE_TERMINAL);
   kbd_echo_str(line);
