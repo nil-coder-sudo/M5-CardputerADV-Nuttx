@@ -90,6 +90,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <poll.h>
+#include <time.h>
 
 /* Wi-Fi UI is built only when the network stack and the wireless ioctls
  * are available.  Everything else works without it.
@@ -104,6 +105,9 @@
 #  include <arpa/inet.h>
 #  include <nuttx/net/net.h>
 #  include <nuttx/wireless/wireless.h>
+#  ifdef CONFIG_LIBC_NETDB
+#    include <netdb.h>
+#  endif
 #endif
 
 /****************************************************************************
@@ -119,7 +123,7 @@
 #endif
 
 #ifndef CARDPUTER_KBD_STACK
-#  define CARDPUTER_KBD_STACK        3584     /* was 4096; Wi-Fi scan    */
+#  define CARDPUTER_KBD_STACK        4096     /* Wi-Fi scan + DNS for NTP */
 #endif
 
 #define KBD_RING_SIZE   256    /* keys + injected Wi-Fi commands          */
@@ -668,6 +672,36 @@ static void icon_battery(int x, int y, uint16_t a)
   gfx_fill_rect(x+13, y+5, 2, 4, a);
   gfx_fill_rect(x+2, y+5, 6, 4, a);
 }
+static void icon_clock(int x, int y, uint16_t a)
+{
+  gfx_round(x, y+1, 14, 14, 7, a);
+  gfx_line(x+7, y+8, x+7, y+4, a);
+  gfx_line(x+7, y+8, x+10, y+10, a);
+}
+
+/* 2x scaled glyph (16 x 32) for the big clock digits */
+
+static void gfx_glyph2x(int x, int y, char ch, uint16_t fg)
+{
+  unsigned char u = (unsigned char)ch;
+  if (u < GFX_FONT_FIRST || u > GFX_FONT_LAST) return;
+  if (!gfx_band_hits(y, GFX_FONT_H * 2)) return;
+  FAR const uint8_t *g = &g_font8x16[(u - GFX_FONT_FIRST) * GFX_FONT_H];
+  for (int row = 0; row < GFX_FONT_H; row++)
+    {
+      int py = y + row * 2;
+      uint8_t bits = g[row];
+      if (!bits || py > g_by1 || py + 1 < g_by0) continue;
+      for (int col = 0; col < GFX_FONT_W; col++)
+        if (bits & (0x80 >> col)) gfx_fill_rect(x + col * 2, py, 2, 2, fg);
+    }
+}
+
+static void gtext2x_center(int cx, int y, FAR const char *s, uint16_t fg)
+{
+  int x = cx - (int)strlen(s) * GFX_FONT_W;
+  for (; *s; s++, x += GFX_FONT_W * 2) gfx_glyph2x(x, y, *s, fg);
+}
 
 /* Wi-Fi fan: a dot plus `bars` arcs (0..3) opening upward. */
 
@@ -1029,13 +1063,14 @@ enum ui_mode_e
   UI_MODE_FILEMANAGER,
   UI_MODE_BATTERY,
   UI_MODE_WIFI,
+  UI_MODE_CLOCK,
   UI_MODE_COUNT
 };
 
 static const char * const g_mode_title[UI_MODE_COUNT] =
 {
   "Cardputer", "Terminal", "ScreenTest", "Keyboard", "Files", "Battery",
-  "Wi-Fi"
+  "Wi-Fi", "Clock"
 };
 
 static volatile int g_ui_mode = UI_MODE_MENU;
@@ -1064,6 +1099,7 @@ static const struct menu_item_s g_menu_items[] =
 #ifdef CARDPUTER_WIFI
   { icon_wifi,     "Wi-Fi",      UI_MODE_WIFI         },
 #endif
+  { icon_clock,    "World Clock", UI_MODE_CLOCK       },
 };
 #define MENU_COUNT ((int)(sizeof(g_menu_items)/sizeof(g_menu_items[0])))
 static int g_menu_sel = 0;
@@ -1135,6 +1171,170 @@ static inline uint16_t battery_color(int pct)
 }
 
 /****************************************************************************
+ * World time core  (city table lives in flash; ~6 bytes of RAM state)
+ *
+ *   Fixed UTC offsets plus the four DST rules that cover the listed cities.
+ *   All maths is done on UTC seconds, so it is independent of the NuttX
+ *   TZ database (none is configured).
+ ****************************************************************************/
+
+enum { DST_NONE = 0, DST_EU, DST_US, DST_AU, DST_NZ };
+
+struct city_s
+{
+  FAR const char *name;
+  int32_t  std;            /* standard-time UTC offset, seconds */
+  uint8_t  dst;            /* DST_* rule */
+};
+
+static const struct city_s g_cities[] =
+{
+  { "Taipei",       8 * 3600,           DST_NONE },
+  { "Tokyo",        9 * 3600,           DST_NONE },
+  { "Singapore",    8 * 3600,           DST_NONE },
+  { "Bangkok",      7 * 3600,           DST_NONE },
+  { "New Delhi",    5 * 3600 + 1800,    DST_NONE },
+  { "Dubai",        4 * 3600,           DST_NONE },
+  { "Moscow",       3 * 3600,           DST_NONE },
+  { "Berlin",       1 * 3600,           DST_EU   },
+  { "London",       0,                  DST_EU   },
+  { "UTC",          0,                  DST_NONE },
+  { "New York",    -5 * 3600,           DST_US   },
+  { "Chicago",     -6 * 3600,           DST_US   },
+  { "Los Angeles", -8 * 3600,           DST_US   },
+  { "Honolulu",   -10 * 3600,           DST_NONE },
+  { "Sydney",      10 * 3600,           DST_AU   },
+  { "Auckland",    12 * 3600,           DST_NZ   },
+};
+#define CITY_COUNT ((int)(sizeof(g_cities) / sizeof(g_cities[0])))
+
+static uint8_t g_home_city = 0;               /* Taipei */
+
+/* Howard Hinnant's days_from_civil / civil_from_days (proleptic Gregorian) */
+
+static int32_t days_from_civil(int y, int m, int d)
+{
+  y -= m <= 2;
+  int32_t era = (y >= 0 ? y : y - 399) / 400;
+  int yoe = y - era * 400;
+  int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+static void civil_from_days(int32_t z, FAR int *y, FAR int *m, FAR int *d)
+{
+  z += 719468;
+  int32_t era = (z >= 0 ? z : z - 146096) / 146097;
+  int doe = (int)(z - era * 146097);
+  int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int mp  = (5 * doy + 2) / 153;
+  *d = doy - (153 * mp + 2) / 5 + 1;
+  *m = mp < 10 ? mp + 3 : mp - 9;
+  *y = yoe + era * 400 + (*m <= 2);
+}
+
+static int weekday_of(int32_t days)            /* 0 = Sunday */
+{
+  return (int)((days % 7 + 11) % 7);
+}
+
+static int last_mday(int y, int m)
+{
+  return (int)(days_from_civil(m == 12 ? y + 1 : y, m == 12 ? 1 : m + 1, 1) -
+               days_from_civil(y, m, 1));
+}
+
+/* Day of month of the n-th Sunday (n = 1..4) or the last one (n = 5). */
+
+static int nth_sunday(int y, int m, int n)
+{
+  if (n < 5)
+    {
+      int wd = weekday_of(days_from_civil(y, m, 1));
+      return 1 + (7 - wd) % 7 + (n - 1) * 7;
+    }
+
+  int ld = last_mday(y, m);
+  return ld - weekday_of(days_from_civil(y, m, ld));
+}
+
+static int64_t utc_at(int y, int m, int d, int hh)
+{
+  return (int64_t)days_from_civil(y, m, d) * 86400 + hh * 3600;
+}
+
+static bool city_in_dst(FAR const struct city_s *c, int64_t t)
+{
+  int y, m, d;
+  int64_t s, e;
+  int32_t sd = c->std;
+
+  if (c->dst == DST_NONE) return false;
+  civil_from_days((int32_t)((t + sd) / 86400), &y, &m, &d);
+
+  switch (c->dst)
+    {
+      case DST_EU:   /* last Sun Mar 01:00 UTC .. last Sun Oct 01:00 UTC */
+        s = utc_at(y, 3, nth_sunday(y, 3, 5), 1);
+        e = utc_at(y, 10, nth_sunday(y, 10, 5), 1);
+        return t >= s && t < e;
+
+      case DST_US:   /* 2nd Sun Mar 02:00 local .. 1st Sun Nov 02:00 local */
+        s = utc_at(y, 3, nth_sunday(y, 3, 2), 2) - sd;
+        e = utc_at(y, 11, nth_sunday(y, 11, 1), 2) - (sd + 3600);
+        return t >= s && t < e;
+
+      case DST_AU:   /* 1st Sun Oct 02:00 .. 1st Sun Apr 03:00 (south) */
+        e = utc_at(y, 4, nth_sunday(y, 4, 1), 3) - (sd + 3600);
+        s = utc_at(y, 10, nth_sunday(y, 10, 1), 2) - sd;
+        return t < e || t >= s;
+
+      case DST_NZ:   /* last Sun Sep 02:00 .. 1st Sun Apr 03:00 (south) */
+        e = utc_at(y, 4, nth_sunday(y, 4, 1), 3) - (sd + 3600);
+        s = utc_at(y, 9, nth_sunday(y, 9, 5), 2) - sd;
+        return t < e || t >= s;
+
+      default:
+        return false;
+    }
+}
+
+static int32_t city_offset(int idx, int64_t t)
+{
+  FAR const struct city_s *c = &g_cities[idx];
+  return c->std + (city_in_dst(c, t) ? 3600 : 0);
+}
+
+struct ltime_s { int y, mo, d, h, mi, s, wday; int32_t days; };
+
+static void city_localtime(int idx, int64_t t, FAR struct ltime_s *lt)
+{
+  int64_t l = t + city_offset(idx, t);
+  int32_t days = (int32_t)(l >= 0 ? l / 86400 : (l - 86399) / 86400);
+  int32_t sec  = (int32_t)(l - (int64_t)days * 86400);
+  civil_from_days(days, &lt->y, &lt->mo, &lt->d);
+  lt->days = days;
+  lt->wday = weekday_of(days);
+  lt->h = sec / 3600; lt->mi = (sec / 60) % 60; lt->s = sec % 60;
+}
+
+/* Current UTC seconds, or -1 if the clock has never been set (it starts at
+ * CONFIG_START_YEAR after boot because there is no RTC).
+ */
+
+static int64_t utc_now(void)
+{
+  struct timespec ts;
+  if (clock_gettime(CLOCK_REALTIME, &ts) < 0) return -1;
+  return (ts.tv_sec >= 1704067200) ? (int64_t)ts.tv_sec : -1;   /* >= 2024 */
+}
+
+static FAR const char * const g_wday[7] =
+{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+
+/****************************************************************************
  * Status bar
  ****************************************************************************/
 
@@ -1148,6 +1348,16 @@ static void statusbar_compose(void)
   int mode = g_ui_mode;
   gtext(6, 0, g_mode_title[(mode >= 0 && mode < UI_MODE_COUNT) ? mode : 0],
         COL_ACCENT);
+
+  int64_t now = utc_now();
+  if (now >= 0 && mode != UI_MODE_CLOCK)
+    {
+      struct ltime_s lt;
+      char tbuf[8];
+      city_localtime(g_home_city, now, &lt);
+      snprintf(tbuf, sizeof(tbuf), "%02d:%02d", lt.h, lt.mi);
+      gtext(100, 0, tbuf, COL_FG);
+    }
 
   int bx=LCD_W-30, by=3, bw=24, bh=11;
   int mv=g_bat.mv;
@@ -1409,7 +1619,7 @@ static void ui_render_rows(compose_t fn, int y0, int y1)
  * Main menu
  ****************************************************************************/
 
-#define MENU_Y0   20
+#define MENU_Y0   18
 #define MENU_STEP 16
 #define MENU_IH   16
 
@@ -1438,7 +1648,8 @@ static void menu_compose(void)
           gtext(40,y,m->label,COL_FG);
         }
     }
-  footer_compose("UP/DN   ENTER   OPT=menu");
+  if (MENU_Y0 + MENU_COUNT * MENU_STEP <= 119)     /* room for a footer? */
+    footer_compose("UP/DN   ENTER   OPT=menu");
 }
 
 static void menu_render(void)       { ui_render(menu_compose); }
@@ -2442,6 +2653,253 @@ static void wifi_tick(void)
 #endif /* CARDPUTER_WIFI */
 
 /****************************************************************************
+ * World Clock app + NTP
+ *
+ *   Big HH:MM:SS of the home city, date, then every city in g_cities[].
+ *   UP/DN = select   ENTER = make it the home city   n = sync with NTP
+ *
+ *   NTP is a single SNTP request over a kernel UDP socket (no ntpc daemon,
+ *   no extra task, ~100 B of stack).  pool.ntp.org is tried via DNS first,
+ *   then two anycast IPs in case DNS isn't configured yet.  The result is
+ *   written with clock_settime(CLOCK_REALTIME); every app, including NSH's
+ *   `date`, then sees the correct time until reboot.
+ ****************************************************************************/
+
+#define CLK_LIST_Y0    70
+#define CLK_ROW_H      16
+#define CLK_VISIBLE    3
+
+static uint8_t g_clk_sel = 0, g_clk_top = 0;
+static int     g_ntp_state = 1;     /* 1 never, 0 ok, 2 running, <0 error */
+
+#ifdef CARDPUTER_WIFI
+
+#define NTP_UNIX_OFFSET 2208988800u          /* 1900 -> 1970 */
+
+static uint32_t be32(FAR const uint8_t *p)
+{
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Parse a 48-byte SNTP server reply into Unix time. */
+
+static int ntp_parse(FAR const uint8_t *pkt, size_t len,
+                     FAR struct timespec *ts)
+{
+  if (len < 48) return -EMSGSIZE;
+  if ((pkt[0] & 7) != 4 || pkt[1] == 0 || pkt[1] > 15) return -EPROTO;
+  uint32_t sec  = be32(pkt + 40);              /* transmit timestamp */
+  uint32_t frac = be32(pkt + 44);
+  if (sec < NTP_UNIX_OFFSET) return -ERANGE;
+  ts->tv_sec  = (time_t)(sec - NTP_UNIX_OFFSET);
+  ts->tv_nsec = (long)(((uint64_t)frac * 1000000000u) >> 32);
+  return OK;
+}
+
+static int ntp_query(FAR const struct sockaddr_in *sa,
+                     FAR struct timespec *ts)
+{
+  struct socket s;
+  struct timeval tv = { 2, 0 };
+  uint8_t pkt[48];
+  ssize_t n;
+  int ret;
+
+  ret = psock_socket(AF_INET, SOCK_DGRAM, 0, &s);
+  if (ret < 0) return ret;
+
+  psock_setsockopt(&s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  memset(pkt, 0, sizeof(pkt));
+  pkt[0] = 0x23;                               /* LI 0, VN 4, mode 3 */
+  n = psock_sendto(&s, pkt, sizeof(pkt), 0,
+                   (FAR const struct sockaddr *)sa, sizeof(*sa));
+  if (n >= 0)
+    n = psock_recvfrom(&s, pkt, sizeof(pkt), 0, NULL, NULL);
+
+  psock_close(&s);
+  if (n < 0) return (int)n;
+  return ntp_parse(pkt, (size_t)n, ts);
+}
+
+static int ntp_sync(void)
+{
+  static const uint32_t fallback[] =
+  {
+    0xd8ef2300u,          /* time.google.com     216.239.35.0  */
+    0xa29fc801u,          /* time.cloudflare.com 162.159.200.1 */
+  };
+
+  struct sockaddr_in sa;
+  struct timespec ts;
+  int ret = -EHOSTUNREACH;
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_port   = htons(123);
+
+#ifdef CONFIG_LIBC_NETDB
+  {
+    struct addrinfo hints;
+    FAR struct addrinfo *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo("pool.ntp.org", NULL, &hints, &res) == 0 && res != NULL)
+      {
+        sa.sin_addr = ((FAR struct sockaddr_in *)res->ai_addr)->sin_addr;
+        ret = ntp_query(&sa, &ts);
+        freeaddrinfo(res);
+      }
+  }
+#endif
+
+  for (size_t i = 0; ret < 0 && i < sizeof(fallback) / sizeof(fallback[0]);
+       i++)
+    {
+      sa.sin_addr.s_addr = htonl(fallback[i]);
+      ret = ntp_query(&sa, &ts);
+    }
+
+  if (ret >= 0 && clock_settime(CLOCK_REALTIME, &ts) < 0) ret = -errno;
+  return ret;
+}
+
+static bool net_link_running(void)
+{
+  struct socket s;
+  struct ifreq ifr;
+  bool up = false;
+
+  if (wifi_sock(&s) < 0) return false;
+  memset(&ifr, 0, sizeof(ifr));
+  wifi_ifname(ifr.ifr_name);
+  if (psock_ioctl(&s, SIOCGIFFLAGS, (unsigned long)(uintptr_t)&ifr) >= 0)
+    up = (ifr.ifr_flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING);
+  psock_close(&s);
+  return up;
+}
+
+#endif /* CARDPUTER_WIFI */
+
+static void clock_compose(void)
+{
+  int64_t now = utc_now();
+  struct ltime_s home, lt;
+  char line[32];
+
+  bg_compose(); statusbar_compose();
+
+  if (now >= 0)
+    {
+      city_localtime(g_home_city, now, &home);
+      snprintf(line, sizeof(line), "%02d:%02d:%02d", home.h, home.mi, home.s);
+      gtext2x_center(LCD_W / 2, 18, line, COL_SEL_FG);
+      snprintf(line, sizeof(line), "%s %04d-%02d-%02d",
+               g_wday[home.wday], home.y, home.mo, home.d);
+      gtext(8, 52, line, COL_FG);
+    }
+  else
+    {
+      gtext2x_center(LCD_W / 2, 18, "--:--:--", COL_DIM);
+      gtext(8, 52, "time not set", COL_DIM);
+    }
+  gtext_right(LCD_W - 8, 52, g_cities[g_home_city].name, COL_ACCENT);
+  gfx_hline(4, 68, LCD_W - 8, COL_SEL_BG);
+
+  for (int i = 0; i < CLK_VISIBLE; i++)
+    {
+      int idx = g_clk_top + i, y = CLK_LIST_Y0 + i * CLK_ROW_H;
+      if (idx >= CITY_COUNT || !gfx_band_hits(y, CLK_ROW_H)) continue;
+      bool sel = (idx == g_clk_sel);
+      if (sel)
+        {
+          gfx_fill_round(4, y, 232, CLK_ROW_H - 1, 5, COL_SEL_BG);
+          gfx_fill_round(6, y + 2, 3, CLK_ROW_H - 5, 1, COL_MARKER);
+        }
+      uint16_t fg = sel ? COL_SEL_FG : COL_FG;
+      gtext(14, y, g_cities[idx].name, idx == g_home_city ? COL_ACCENT : fg);
+
+      if (now < 0)
+        {
+          gtext(110, y, "--:--", COL_DIM);
+          continue;
+        }
+
+      city_localtime(idx, now, &lt);
+      snprintf(line, sizeof(line), "%02d:%02d", lt.h, lt.mi);
+      gtext(110, y, line, fg);
+      if (lt.days != home.days) gtext(154, y, g_wday[lt.wday], COL_DIM);
+
+      int32_t diff = city_offset(idx, now) - city_offset(g_home_city, now);
+      int32_t ad = diff < 0 ? -diff : diff;
+      if (diff == 0)
+        strlcpy(line, "0", sizeof(line));
+      else if (ad % 3600)
+        snprintf(line, sizeof(line), "%c%d:%02d", diff < 0 ? '-' : '+',
+                 (int)(ad / 3600), (int)(ad % 3600 / 60));
+      else
+        snprintf(line, sizeof(line), "%+dh", (int)(diff / 3600));
+      gtext_right(LCD_W - 8, y, line, COL_DIM);
+    }
+
+  FAR const char *st =
+      g_ntp_state == 0 ? "NTP ok"  :
+      g_ntp_state == 2 ? "sync.."  :
+      g_ntp_state == 1 ? "no NTP"  :
+      g_ntp_state == -ENETDOWN ? "no WiFi" : "NTP err";
+  footer_compose("n=sync ok=home");
+  gtext_right(LCD_W - 6, 119, st, g_ntp_state == 0 ? COL_OK : COL_WARN);
+}
+
+static void clock_render(void) { ui_render(clock_compose); }
+
+static void clock_sync(void)
+{
+#ifdef CARDPUTER_WIFI
+  if (!net_link_running())
+    {
+      g_ntp_state = -ENETDOWN;
+      clock_render();
+      return;
+    }
+
+  g_ntp_state = 2;
+  clock_render();
+  g_ntp_state = ntp_sync() >= 0 ? 0 : -EIO;
+#else
+  g_ntp_state = -ENOSYS;
+#endif
+  clock_render();
+}
+
+static void clock_enter(void)
+{
+  clock_render();
+  if (utc_now() < 0) clock_sync();          /* first visit: get the time */
+}
+
+static void clock_handle(int navkey, char ch)
+{
+  if (navkey == NAV_UP)
+    g_clk_sel = (uint8_t)((g_clk_sel + CITY_COUNT - 1) % CITY_COUNT);
+  else if (navkey == NAV_DOWN)
+    g_clk_sel = (uint8_t)((g_clk_sel + 1) % CITY_COUNT);
+  else if (ch == '\r' || ch == '\n')
+    g_home_city = g_clk_sel;
+  else if (ch == 'n' || ch == 'N')
+    { clock_sync(); return; }
+  else
+    return;
+
+  if (g_clk_sel < g_clk_top) g_clk_top = g_clk_sel;
+  if (g_clk_sel >= g_clk_top + CLK_VISIBLE)
+    g_clk_top = (uint8_t)(g_clk_sel - CLK_VISIBLE + 1);
+  clock_render();
+}
+
+/****************************************************************************
  * Mode switch
  ****************************************************************************/
 
@@ -2472,6 +2930,8 @@ static void ui_enter_mode(int mode)
       case UI_MODE_WIFI:
         wifi_enter(); break;
 #endif
+      case UI_MODE_CLOCK:
+        clock_enter(); break;
       case UI_MODE_TERMINAL:
         con_clear(); statusbar_render();
         ringdev_putc(&g_kbd_ring,'\n'); break;
@@ -2523,7 +2983,7 @@ static int kbd_nsh_thread(int argc, FAR char *argv[])
 #define KBD_POLL_US     20000
   uint32_t last_key_ms=0;
   uint8_t  last_key_raw=0;
-  uint32_t bar_last_ms=0, bat_last_ms=0, wifi_last_ms=0;
+  uint32_t bar_last_ms=0, bat_last_ms=0, wifi_last_ms=0, clk_last_ms=0;
 
   UNUSED(argc); UNUSED(argv);
 
@@ -2654,6 +3114,11 @@ static int kbd_nsh_thread(int argc, FAR char *argv[])
                     break;
 #endif
 
+                  case UI_MODE_CLOCK:
+                    if (navkey==NAV_NONE) navkey=nav_from_base(base);
+                    clock_handle(navkey, ch);
+                    break;
+
                   case UI_MODE_BATTERY:
                   default: break;
                 }
@@ -2676,6 +3141,9 @@ static int kbd_nsh_thread(int argc, FAR char *argv[])
 
       if (g_ui_mode==UI_MODE_BATTERY && (now-bat_last_ms) >= 1000)
         { bat_last_ms=now; battery_render(); }
+
+      if (g_ui_mode==UI_MODE_CLOCK && (now-clk_last_ms) >= 1000)
+        { clk_last_ms=now; ui_render_rows(clock_compose, 16, 134); }
 
 #ifdef CARDPUTER_WIFI
       if (g_ui_mode==UI_MODE_WIFI && (now-wifi_last_ms) >= WIFI_STATUS_MS)

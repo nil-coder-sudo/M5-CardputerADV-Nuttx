@@ -55,7 +55,9 @@ content.
 
 ## Features
 
-- **Launcher menu** with six built‑in apps.
+- **Launcher menu** with seven built‑in apps.
+- **World Clock** — 16 cities with automatic daylight‑saving time, synced
+  over NTP; the current time also appears in the status bar.
 - **Wi‑Fi app** — scan, pick a network, type the passphrase on the
   keyboard, join, and get a DHCP lease. Status card shows SSID, IP and RSSI.
 - **Low‑RAM banded renderer** — screens are drawn 16 pixel rows at a time
@@ -263,6 +265,29 @@ On success the firmware switches to the **Terminal** and runs
 handed straight to the driver with ioctls — it never goes through the shell
 and is wiped from memory afterwards. The app's state (~430 B) only exists
 on the heap while the app is open.
+
+### 7. World Clock
+
+Shows the home city's time in large digits, the date, and a scrollable list
+of 16 cities (Taipei, Tokyo, Singapore, Bangkok, New Delhi, Dubai, Moscow,
+Berlin, London, UTC, New York, Chicago, Los Angeles, Honolulu, Sydney,
+Auckland) with each city's time and its offset from home. Daylight‑saving
+time is applied automatically for Europe, the US, Australia and New Zealand.
+
+| Key | Action |
+|-----|--------|
+| **UP / DOWN** | Move through the city list |
+| **ENTER** | Make the selected city the home city |
+| **n** | Sync with NTP now |
+
+The Cardputer has no battery‑backed clock, so the time is unknown after
+boot. The first time you open World Clock with Wi‑Fi connected it syncs
+automatically (`pool.ntp.org`, falling back to `time.google.com` and
+`time.cloudflare.com`). Once synced, the status bar shows `HH:MM` and NSH's
+`date` command shows the correct time until the next reboot. The footer shows
+`NTP ok`, `sync..`, `no WiFi` or `NTP err`.
+
+### Wi‑Fi from the terminal
 
 You can also manage Wi‑Fi from the terminal with the stock tools:
 
