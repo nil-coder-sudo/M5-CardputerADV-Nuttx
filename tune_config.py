@@ -64,6 +64,12 @@ TUNE = {
     # 1 MHz made a full redraw take ~0.5 s.  The panel runs fine at 40 MHz
     # on the Cardputer; drop to 20000000 if you ever see corruption.
     "LCD_ST7789_FREQUENCY": "40000000",
+    # Cardputer panel with the stock NuttX ST7789 driver (verified on the
+    # device): the driver swaps X/Y offsets in landscape, and the panel
+    # needs display inversion on.
+    "LCD_ST7789_XOFFSET": "53",
+    "LCD_ST7789_YOFFSET": "40",
+    "LCD_ST7789_INVCOLOR": "y",
 }
 
 

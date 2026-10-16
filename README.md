@@ -155,8 +155,15 @@ echo CONFIG_ESP32S3_APP_FORMAT_LEGACY=y >> .config
 make olddefconfig && make -j
 ```
 
-Copy the resulting `nuttx.bin` to the SD card and install it from Launcher's
-SD menu. **Do not run `make flash` in this mode** — it writes NuttX's own
+Then wrap it with the partition table Launcher expects (app at `0x10000`):
+
+```bash
+python3 ../M5-CardputerADV-Nuttx/mk_launcher_bin.py nuttx.bin   # -> nuttx-launcher.bin
+```
+
+Copy `nuttx-launcher.bin` to the SD card and install it from Launcher's
+SD menu. The script refuses simple-boot images, which cannot run from an
+OTA partition. **Do not run `make flash` in this mode** — it writes NuttX's own
 bootloader and partition table and erases Launcher.
 
 Under Launcher the saved Wi‑Fi networks go to the highest flash sector that
