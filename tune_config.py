@@ -47,6 +47,10 @@ TUNE = {
     "NETDB_DNSCLIENT_NAMESIZE": "64",                # was 256 (-2 KB cache)
 
     # --- System -----------------------------------------------------------
+    # REQUIRED for Wi-Fi: the ESP Wi-Fi adapter creates recursive mutexes;
+    # without this pthread_mutexattr_settype() returns ENOSYS and
+    # esp_wifi_init() fails with ESP_ERR_NO_MEM (board_wlan_init: -12).
+    "PTHREAD_MUTEX_TYPES": "y",
     "SYSLOG_MAX_CHANNELS": "2",      # lets the LCD syslog mirror register
     "TASK_NAME_SIZE": "15",          # was 31 (per task)
     "STACK_COLORATION": "y",         # `ps` shows real stack use -> tune
