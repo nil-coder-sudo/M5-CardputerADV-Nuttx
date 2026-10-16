@@ -1035,6 +1035,12 @@ static const char * const g_mode_title[UI_MODE_COUNT] =
 };
 
 static volatile int g_ui_mode = UI_MODE_MENU;
+
+/* board_wlan_init() result, shown by the Wi-Fi app (1 = never called) */
+
+#if defined(CONFIG_ESPRESSIF_WIFI) || defined(CONFIG_ESP32S3_WIFI)
+static int g_wlan_init_ret = 1;
+#endif
 enum { NAV_NONE=0, NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT };
 
 struct menu_item_s
@@ -1872,7 +1878,12 @@ static void wifi_status_refresh(FAR struct wifi_ui_s *w)
     }
   else
     {
-      strlcpy(w->msg, "no " WIFI_IFNAME " device", sizeof(w->msg));
+      if (g_wlan_init_ret < 0)
+        snprintf(w->msg, sizeof(w->msg), "wifi init err %d", g_wlan_init_ret);
+      else if (g_wlan_init_ret == 1)
+        strlcpy(w->msg, "board_wlan_init not run", sizeof(w->msg));
+      else
+        strlcpy(w->msg, "no " WIFI_IFNAME " device", sizeof(w->msg));
     }
 
   memset(&ifr, 0, sizeof(ifr));
@@ -2182,10 +2193,35 @@ static void wifi_render(void) { ui_render(wifi_compose); }
 
 /* --- actions ------------------------------------------------------------ */
 
+/* Bring wlan0 up if NSH's netinit didn't; report the driver's error. */
+
+static void wifi_ifup(FAR struct wifi_ui_s *w)
+{
+  struct socket s;
+  struct ifreq  ifr;
+  int ret;
+
+  if (w->up || wifi_sock(&s) < 0) return;
+  memset(&ifr, 0, sizeof(ifr));
+  wifi_ifname(ifr.ifr_name);
+  if (psock_ioctl(&s, SIOCGIFFLAGS, (unsigned long)(uintptr_t)&ifr) >= 0)
+    {
+      ifr.ifr_flags |= IFF_UP;
+      ret = psock_ioctl(&s, SIOCSIFFLAGS, (unsigned long)(uintptr_t)&ifr);
+      if (ret < 0) snprintf(w->msg, sizeof(w->msg), "ifup err %d", ret);
+    }
+  psock_close(&s);
+  wifi_status_refresh(w);
+}
+
 static void wifi_enter(void)
 {
   if (g_wifi == NULL) g_wifi = kmm_zalloc(sizeof(struct wifi_ui_s));
-  if (g_wifi != NULL) wifi_status_refresh(g_wifi);
+  if (g_wifi != NULL)
+    {
+      wifi_status_refresh(g_wifi);
+      if (!g_wifi->up && g_wlan_init_ret == 0) wifi_ifup(g_wifi);
+    }
   wifi_render();
 }
 
@@ -2803,6 +2839,7 @@ int esp32s3_bringup(void)
 
 #ifdef CONFIG_ESPRESSIF_WIFI
   ret=board_wlan_init();
+  g_wlan_init_ret=ret;
   if (ret<0) syslog(LOG_ERR,"board_wlan_init failed: %d\n",ret);
 #endif
 
