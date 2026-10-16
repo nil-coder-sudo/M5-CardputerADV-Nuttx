@@ -135,6 +135,10 @@ FAR struct lcd_dev_s *st7789_lcdinitialize(FAR struct spi_dev_s *spi);
 int board_spiflash_init(void);
 #endif
 
+#ifdef CONFIG_ESPRESSIF_HR_TIMER
+int esp_hr_timer_init(void);   /* arch/xtensa/src/common/espressif */
+#endif
+
 /****************************************************************************
  * TCA8418 / keyboard constants
  ****************************************************************************/
@@ -2836,6 +2840,17 @@ int esp32s3_bringup(void)
   /* Wi-Fi first: esp_wifi_init() wants a large contiguous heap block, which
    * is easiest to get before the rest of the system starts allocating.
    */
+
+#ifdef CONFIG_ESPRESSIF_HR_TIMER
+  /* The Wi-Fi PHY creates esp_timers on first RF enable; they fail with
+   * ESP_ERR_INVALID_STATE (259) unless the HR timer subsystem is up.
+   * NuttX before 2026-08 (commit 3d30272ce) leaves this to the board.
+   * Idempotent, so harmless on newer trees that also call it.
+   */
+
+  ret=esp_hr_timer_init();
+  if (ret<0) syslog(LOG_ERR,"esp_hr_timer_init failed: %d\n",ret);
+#endif
 
 #ifdef CONFIG_ESPRESSIF_WIFI
   ret=board_wlan_init();
