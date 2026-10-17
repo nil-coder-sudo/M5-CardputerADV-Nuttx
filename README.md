@@ -190,10 +190,8 @@ Under Launcher the saved Wi‑Fi networks go to the highest flash sector that
 no partition uses; if Launcher has handed out the whole flash, networks are
 not saved and the terminal says `(not saved)`.
 
-**Finding out where a boot stops (no PC needed).** Every bring-up step is
-listed on a *NuttX boot* screen until the menu appears, so a boot that hangs
-shows the last step reached. For more, build with `CONFIG_DEBUG_FEATURES=y`
-and add one line to `esp32s3_board_initialize()` in
+**Required for Launcher: the early-init hook.** Add one line to
+`esp32s3_board_initialize()` in
 `boards/xtensa/esp32s3/esp32s3-devkit/src/esp32s3_boot.c`:
 
 ```c
@@ -204,7 +202,20 @@ void esp32s3_board_initialize(void)
 }
 ```
 
-Then:
+Launcher starts the app with `esp_restart()`, which resets the CPU but not
+the interrupt matrix, the GPIO interrupt settings or most peripherals
+(SPI2, I2C, LEDC, ADC ...). ESP-IDF apps clear these at start-up; NuttX does
+not, so interrupt sources Launcher left routed to CPU interrupts (for
+example its GPIO11 keyboard interrupt) fire into whatever NuttX later puts
+on those CPU interrupts, and the system hangs with no message right after
+it starts. `cardputer_early_init()` clears the interrupt matrix and GPIO
+interrupts and resets those peripherals before the OS starts. It is
+harmless when flashed normally.
+
+**Finding out where a boot stops (no PC needed).** Every bring-up step is
+listed on a *NuttX boot* screen until the menu appears, so a boot that hangs
+shows the last step reached. With `CONFIG_DEBUG_FEATURES=y` and the hook
+above you also get:
 
 | What the screen shows | Meaning |
 |---|---|
@@ -215,7 +226,7 @@ Then:
 
 The early screen and the crash screen drive the LCD with bit-banged GPIOs,
 so they work even when the SPI/LCD drivers are not up or are what crashed.
-Without the debug option, the hook only switches the backlight on.
+Without the debug option, the hook does the clean-up and switches the backlight on.
 
 ### 6. (Optional) Serial monitor
 

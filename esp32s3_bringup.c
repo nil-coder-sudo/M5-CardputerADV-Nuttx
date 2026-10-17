@@ -690,6 +690,10 @@ static void gtext_right(int rx, int y, FAR const char *s, uint16_t fg)
 static char          g_boot_log[BOOT_LINES][COLS + 1];
 static int           g_boot_n;
 static volatile bool g_boot_screen = true;   /* until the menu takes over */
+#ifdef CONFIG_DEBUG_FEATURES
+static bool          g_boot_bitbang;         /* LCD pins are plain GPIOs */
+static void bb_frame(void (*fn)(void));
+#endif
 
 static void compose_boot(void)
 {
@@ -725,7 +729,12 @@ static void boot_step(FAR const char *fmt, ...)
           g_boot_n--;
         }
       snprintf(g_boot_log[g_boot_n++], sizeof(g_boot_log[0]), "%s", line);
-      gfx_render_all(compose_boot);          /* no-op until the LCD is up */
+      if (g_gfx_ready)
+        gfx_render_all(compose_boot);
+#ifdef CONFIG_DEBUG_FEATURES
+      else if (g_boot_bitbang)
+        bb_frame(compose_boot);              /* LCD driver not up yet */
+#endif
     }
   nxmutex_unlock(&g_con_mutex);
 }
@@ -898,6 +907,77 @@ static void gtext_small(int x, int y, FAR const char *s, uint16_t fg)
     }
 }
 
+/* M5 Launcher (any ESP-IDF app) restarts into us with esp_restart(), which
+ * resets only the CPU plus a few blocks (timers, SPI0/1, UART, GDMA, Wi-Fi).
+ * Everything else keeps the old firmware's register values.  For SPI2 that
+ * includes SPI_DMA_CONF: Launcher drives the LCD with DMA, NuttX's driver
+ * (CPU mode) never clears those bits, so the first SPI transfer to the LCD
+ * never completes and board_lcd_initialize() spins forever -- black screen.
+ * Pulse the reset of every block we may use; peripherals that were already
+ * held in reset stay that way.  GDMA is left alone (NuttX set it up by now).
+ */
+
+#define SYS_PERIP_RST_EN0  0x600c0020u
+#define SYS_PERIP_RST_EN1  0x600c0024u
+
+static void board_reset_peripherals(void)
+{
+  const uint32_t m0 = (1u << 4)  | (1u << 6)  | (1u << 7)  | (1u << 9)  |
+                      (1u << 10) | (1u << 11) | (1u << 16) | (1u << 17) |
+                      (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) |
+                      (1u << 22) | (1u << 27) | (1u << 28);
+                      /* I2S0 SPI2 I2C0 RMT PCNT LEDC SPI3 PWM0 I2C1 TWAI
+                       * PWM1 I2S1 SPI2_DMA SPI3_DMA APB_SARADC */
+  const uint32_t m1 = (1u << 7)  | (1u << 8);          /* SDIO_HOST LCD_CAM */
+  volatile uint32_t *r0 = (volatile uint32_t *)SYS_PERIP_RST_EN0;
+  volatile uint32_t *r1 = (volatile uint32_t *)SYS_PERIP_RST_EN1;
+  uint32_t o0 = *r0;
+  uint32_t o1 = *r1;
+
+  *r0 = o0 | m0;
+  *r1 = o1 | m1;
+  for (volatile int i = 0; i < 100; i++);
+  *r0 = o0;
+  *r1 = o1;
+}
+
+/* esp_restart() does not reset the interrupt matrix either: every
+ * peripheral interrupt source Launcher routed to a CPU interrupt is still
+ * routed there.  NuttX (unlike ESP-IDF's own startup) does not clear it,
+ * so a stale source -- e.g. Launcher's falling-edge interrupt on GPIO11,
+ * which stays pending while the TCA8418 holds INT low -- lands on a CPU
+ * interrupt NuttX later enables for something else and fires forever.
+ * The system then hangs right after start-up with no message.  Must run
+ * before the OS enables interrupts, so only from cardputer_early_init().
+ */
+
+#define INTMTX_CORE0_BASE  0x600c2000u
+#define INTMTX_CORE1_BASE  0x600c2800u
+#define INTMTX_NSOURCES    99                /* map regs 0x000..0x188 */
+#define INTMTX_INVALID     6                 /* ETS_INVALID_INUM */
+#define GPIO_REG_BASE      0x60004000u
+#define GPIO_STATUS_W1TC   (GPIO_REG_BASE + 0x4c)
+#define GPIO_STATUS1_W1TC  (GPIO_REG_BASE + 0x58)
+#define GPIO_PIN_REG(n)    (GPIO_REG_BASE + 0x74 + 4 * (n))
+
+static void board_clear_interrupts(void)
+{
+  for (int n = 0; n <= 48; n++)
+    {
+      volatile uint32_t *r = (volatile uint32_t *)GPIO_PIN_REG(n);
+      *r &= ~((7u << 7) | (1u << 10) | (0x1fu << 13)); /* type, wake, ena */
+    }
+
+  *(volatile uint32_t *)GPIO_STATUS_W1TC  = 0xffffffffu;
+  *(volatile uint32_t *)GPIO_STATUS1_W1TC = 0x0003ffffu;
+
+  for (int i = 0; i < INTMTX_NSOURCES; i++)
+    {
+      *(volatile uint32_t *)(INTMTX_CORE0_BASE + 4 * i) = INTMTX_INVALID;
+      *(volatile uint32_t *)(INTMTX_CORE1_BASE + 4 * i) = INTMTX_INVALID;
+    }
+}
+
 /* Very first thing NuttX does (called from esp32s3_board_initialize(),
  * before the OS starts): light the backlight and draw a frame.  If this
  * screen does not appear, NuttX never got control from the bootloader.
@@ -912,9 +992,12 @@ static void compose_early(void)
 
 void cardputer_early_init(void)
 {
+  board_clear_interrupts();
+  board_reset_peripherals();
 #ifdef CONFIG_DEBUG_FEATURES
   bb_lcd_begin(true);
   bb_frame(compose_early);
+  g_boot_bitbang = true;                    /* boot steps bit-banged too */
 #else
   esp_configgpio(PIN_LCD_BL, OUTPUT);
   esp_gpio_matrix_out(PIN_LCD_BL, SIG_GPIO_OUT_IDX, false, false);
@@ -4240,6 +4323,10 @@ int board_lcd_initialize(void)
 
   spi=esp32s3_spibus_initialize(2);
   if (!spi) return -ENODEV;
+#ifdef CONFIG_DEBUG_FEATURES
+  g_boot_bitbang = false;                    /* SPI2 owns the pins now */
+#endif
+  BTRACE("spi2 ok, st7789 init...\n");
 
   g_lcddev=st7789_lcdinitialize(spi);
   if (!g_lcddev) return -ENODEV;
@@ -4272,6 +4359,7 @@ int esp32s3_bringup(void)
 #ifdef CARDPUTER_PANIC_SCREEN
   panic_notifier_chain_register(&g_panic_nb);
 #endif
+  board_reset_peripherals();                 /* also without the hook */
   BTRACE("bringup start\n");
   board_reclaim_gpios();                     /* before any esp_gpiowrite() */
   BTRACE("gpios reclaimed\n");
@@ -4283,6 +4371,7 @@ int esp32s3_bringup(void)
   /* LCD first, so every later step shows up on the boot screen. */
 
 #if defined(CONFIG_LCD)
+  BTRACE("lcd init...\n");
   lcd_ret=board_lcd_initialize();
   BTRACE("lcd init %d\n", lcd_ret);
 #endif
