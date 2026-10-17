@@ -16,6 +16,16 @@ write-protected.  NuttX clears the enable bit without writing the unlock
 key first, so the watchdog keeps running and resets the chip about a second
 after NuttX starts.
 
+Third, the same HAL update renamed and split the objects that must run
+from IRAM while the flash cache is off (esp_cache_utils, mmu_hal,
+mspi_timing_*, ...).  esp32s3_sections.ld (simple boot) was updated,
+legacy_sections.ld was not: e.g. esp_cache_suspend_ext_mem_cache() stays
+in flash, and the first flash operation (reading the flash ID in
+init_flash) suspends the cache from code that lives behind that cache.
+Whether the CPU then stalls depends on what happens to be cached, which is
+why one build hung and another did not.  The missing IRAM/DRAM placement
+rules are copied from esp32s3_sections.ld.
+
 usage:  python3 fix_legacy_ld.py ~/nuttxspace/nuttx
 """
 import re
@@ -70,6 +80,54 @@ def fix_wdt(top):
     print(f"{src}: fixed (backup: esp32s3_wdt.c.orig)")
 
 
+SYNC_TAG = "/* rules synced from esp32s3_sections.ld by fix_legacy_ld.py */"
+
+
+def section_rules(text, name):
+    """Unconditional input-section rules of output section `name`."""
+    m = re.search(r"^  " + re.escape(name) + r"\b[^\n]*\n  \{\n(.*?)^  \}",
+                  text, re.M | re.S)
+    if not m:
+        return None, None
+    rules, depth = [], 0
+    for line in m.group(1).split("\n"):
+        st = line.strip()
+        if st.startswith("#if"):
+            depth += 1
+        elif st.startswith("#endif"):
+            depth -= 1
+        elif depth == 0 and re.match(r"(ARCHLIB|\*lib)[^ ]*:", st) and \
+                st.endswith(")"):
+            rules.append(st)
+    return rules, m
+
+
+def sync_rules(top, ld, s):
+    simple = (top / "boards/xtensa/esp32s3/common/scripts/"
+              "esp32s3_sections.ld").read_text()
+    if SYNC_TAG in s:
+        return s, 0
+    added = 0
+    for name, anchor in ((".iram0.text", "    *(.wifirxiram"),
+                         (".dram0.data", "    _edata = ABSOLUTE(.);")):
+        want, _ = section_rules(simple, name)
+        have, m = section_rules(s, name)
+        if not want or have is None:
+            sys.exit(f"error: no {name} section; edit {ld} by hand")
+        norm = {" ".join(r.split()) for r in have}
+        new = [r for r in want if " ".join(r.split()) not in norm]
+        body = m.group(1)
+        i = body.find(anchor)
+        if i < 0:
+            sys.exit(f"error: anchor for {name} not found; edit {ld} by hand")
+        block = ("    " + SYNC_TAG + "\n" +
+                 "".join(f"    {r}\n" for r in new) + "\n")
+        body = body[:i] + block + body[i:]
+        s = s[:m.start(1)] + body + s[m.end(1):]
+        added += len(new)
+    return s, added
+
+
 def main():
     top = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     fix_wdt(top)
@@ -77,8 +135,17 @@ def main():
     if not ld.exists():
         sys.exit(f"error: {ld} not found (pass the nuttx directory)")
     s = ld.read_text()
+    orig = s
+    s, added = sync_rules(top, ld, s)
+    if added:
+        print(f"{ld}: {added} IRAM/DRAM placement rules added")
     if "rtc.force_slow" in s:
-        print(f"{ld}: already fixed")
+        if s != orig:
+            if not ld.with_suffix(".ld.orig").exists():
+                ld.with_suffix(".ld.orig").write_text(orig)
+            ld.write_text(s)
+        else:
+            print(f"{ld}: already fixed")
         return
 
     m = re.search(r"^([ \t]*)\.rtc\.data\s*:\s*\n[ \t]*\{[ \t]*\n", s, re.M)
@@ -95,7 +162,8 @@ def main():
          s[m.start():insert_at] +
          f"{body_indent}*(.rtc.force_slow .rtc.force_slow.*)\n" +
          s[insert_at:])
-    ld.with_suffix(".ld.orig").write_text(ld.read_text())
+    if not ld.with_suffix(".ld.orig").exists():
+        ld.with_suffix(".ld.orig").write_text(orig)
     ld.write_text(s)
     print(f"{ld}: fixed (backup: legacy_sections.ld.orig).  Rebuild with "
           f"'make -j'.")

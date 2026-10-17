@@ -212,6 +212,16 @@ it starts. `cardputer_early_init()` clears the interrupt matrix and GPIO
 interrupts and resets those peripherals before the OS starts. It is
 harmless when flashed normally.
 
+`fix_legacy_ld.py` also brings `legacy_sections.ld` up to date with the
+simple-boot script: since the HAL update the code that suspends the flash
+cache (`esp_cache_utils`, `mmu_hal`, `mspi_timing_*`, ...) moved to new
+object files that only the simple-boot script places in IRAM. In legacy
+builds it stayed in flash, so the first flash access (reading the flash ID
+in `init_flash`) suspended the cache from code behind that cache and the
+CPU stalled -- or not, depending on what happened to be cached, which is
+why one build hung and another booted. Costs ~8 KB of IRAM, the same as
+simple boot.
+
 `fix_legacy_ld.py` also patches NuttX's `esp32s3_wdt_early_deinit()`:
 `esp_restart()` arms the RTC watchdog (about one second) and write-protects
 it; NuttX cleared the enable bit without unlocking first, so the chip reset
