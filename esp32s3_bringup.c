@@ -1078,6 +1078,48 @@ static void board_disable_watchdogs(void)
   REG32(RTC_SWD_WPROTECT) = 0;
 }
 
+/* Hang probe.  Timer-group 1's watchdog is armed at early init with an
+ * 8 s first stage that raises an interrupt routed to CPU interrupt 14, the
+ * Xtensa NMI: it cannot be masked, so it fires even when interrupts are off
+ * or an interrupt storm keeps the CPU busy.  NuttX turns an NMI into a
+ * panic, and the panic screen then shows the PC where the CPU was stuck.
+ * The bring-up disarms it as its first step.
+ */
+
+#define TG1_BASE           0x60020000u
+#define TG1_WDT_SOURCE     51                /* ETS_TG1_WDT_LEVEL_INTR_SOURCE */
+#define CPUINT_NMI         14
+#define SYS_PERIP_CLK_EN0  0x600c0018u
+
+static void board_arm_hang_probe(void)
+{
+  REG32(SYS_PERIP_CLK_EN0) |= 1u << 15;      /* TIMERGROUP1 clock */
+  REG32(SYS_PERIP_RST_EN0) &= ~(1u << 15);
+
+  REG32(TIMG_WDTWPROTECT(TG1_BASE)) = WDT_WKEY;
+  REG32(TIMG_WDTCONFIG0(TG1_BASE))  = 0;
+  REG32(TG1_BASE + 0x4c) = 40000u << 16;     /* 80 MHz / 40000 = 2 kHz */
+  REG32(TG1_BASE + 0x50) = 16000;            /* stage 0: 8 s */
+  REG32(TIMG_WDTCONFIG0(TG1_BASE)) = (1u << 31) | (1u << 29) |
+                                     (7u << 18) | (7u << 15);
+  REG32(TG1_BASE + 0x60) = 1;                /* feed: start counting now */
+  REG32(TIMG_WDTWPROTECT(TG1_BASE)) = 0;
+
+  REG32(TG1_BASE + 0x7c)  = 1u << 2;         /* clear, then enable WDT int */
+  REG32(TG1_BASE + 0x70) |= 1u << 2;
+  REG32(INTMTX_CORE0_BASE + 4 * TG1_WDT_SOURCE) = CPUINT_NMI;
+}
+
+static void board_disarm_hang_probe(void)
+{
+  REG32(INTMTX_CORE0_BASE + 4 * TG1_WDT_SOURCE) = INTMTX_INVALID;
+  REG32(TIMG_WDTWPROTECT(TG1_BASE)) = WDT_WKEY;
+  REG32(TIMG_WDTCONFIG0(TG1_BASE)) &= ~((1u << 31) | (1u << 14));
+  REG32(TIMG_WDTWPROTECT(TG1_BASE)) = 0;
+  REG32(TG1_BASE + 0x70) &= ~(1u << 2);
+  REG32(TG1_BASE + 0x7c)  = 1u << 2;
+}
+
 /* Very first thing NuttX does (called from esp32s3_board_initialize(),
  * before the OS starts): light the backlight and draw a frame.  If this
  * screen does not appear, NuttX never got control from the bootloader.
@@ -1094,48 +1136,31 @@ static void compose_early(void)
   gtext(8, 88, buf, 0xffe0);
 }
 
-void cardputer_early_init(void)
-{
-  board_disable_watchdogs();                 /* first: RWDT is ~1 s away */
-  g_reset_cause = (uint8_t)(REG32(RTC_RESET_STATE) & 0x3f);
-  board_clear_interrupts();
-  board_reset_peripherals();
-  bb_lcd_begin(true);
-  bb_frame(compose_early);
-  g_boot_bitbang = true;                    /* boot steps bit-banged too */
-}
-
 /****************************************************************************
- * Panic screen
+ * Crash screen
  *
- *   The last syslog lines are kept in a small ring; on a panic they are
- *   drawn in red together with the task, file:line and PC.
+ *   A syslog channel, registered before the OS starts, keeps the last log
+ *   lines (prefixes like "up_dump_register:" dropped, spaces squeezed so a
+ *   register line fits 30 columns).  The screen is drawn
+ *     - from the panic notifier (registered in the bring-up), with task,
+ *       file:line and PC, or
+ *     - for a crash before that, when the register dump's "VADDR:" line has
+ *       been printed -- this also catches the NMI from the hang probe.
  ****************************************************************************/
 
 #ifdef CARDPUTER_PANIC_SCREEN
-#define TAIL_LINES 8
+#define TAIL_LINES  14
 #define PANIC_LINES 16
+#define RAW_MAX     120
 
 static char g_tail[TAIL_LINES][COLS + 1];
-static int  g_tail_head;                   /* line being written */
-static int  g_tail_col;
+static int  g_tail_next;                   /* ring slot for the next line */
+static char g_raw[RAW_MAX + 1];
+static int  g_raw_len;
 static char g_panic_txt[PANIC_LINES][COLS + 1];
 static int  g_panic_n;
 static bool g_panic_drawn;
-
-static void tail_putc(int c)
-{
-  if (c == '\r') return;
-  if (c == '\n' || g_tail_col >= COLS)
-    {
-      g_tail_head = (g_tail_head + 1) % TAIL_LINES;
-      g_tail_col = 0;
-      g_tail[g_tail_head][0] = '\0';
-      if (c == '\n') return;
-    }
-  g_tail[g_tail_head][g_tail_col++] = (char)c;
-  g_tail[g_tail_head][g_tail_col] = '\0';
-}
+static bool g_panic_nb_registered;
 
 static void panic_line(FAR const char *fmt, ...)
   __attribute__((format(printf, 1, 2)));
@@ -1155,6 +1180,101 @@ static void compose_panic(void)
     gtext_small(0, i * 8 + 2, g_panic_txt[i], i == 0 ? 0xffe0 : 0xffff);
 }
 
+static void panic_add_tail(void)
+{
+  for (int i = 0; i < TAIL_LINES; i++)
+    {
+      FAR const char *t = g_tail[(g_tail_next + i) % TAIL_LINES];
+      if (t[0]) panic_line("%s", t);
+    }
+}
+
+static void panic_draw(void)
+{
+  g_panic_drawn = true;
+  bb_lcd_begin(false);
+  bb_frame(compose_panic);
+}
+
+static void tail_push(FAR const char *s)
+{
+  snprintf(g_tail[g_tail_next], COLS + 1, "%s", s);
+  g_tail_next = (g_tail_next + 1) % TAIL_LINES;
+}
+
+/* One complete log line: compress, drop noise, store wrapped. */
+
+static void tail_line(void)
+{
+  char buf[RAW_MAX + 1];
+  FAR const char *p = g_raw;
+  FAR const char *q;
+  int n = 0;
+
+  g_raw[g_raw_len] = '\0';
+  g_raw_len = 0;
+
+  /* "function_name: text" -> "text" */
+
+  for (q = p; *q == '_' || (*q >= 'a' && *q <= 'z') ||
+              (*q >= '0' && *q <= '9'); q++);
+  if (q != p && q[0] == ':' && q[1] == ' ') p = q + 2;
+
+  for (; *p && n < RAW_MAX; p++)
+    {
+      if (*p == ' ' && (n == 0 || buf[n - 1] == ' ')) continue;
+      buf[n++] = *p;
+    }
+  while (n > 0 && buf[n - 1] == ' ') n--;
+  buf[n] = '\0';
+  if (n == 0) return;
+
+  /* Upper registers and the version banner only push useful lines out. */
+
+  if (strncmp(buf, "A4:", 3) == 0 || strncmp(buf, "A8:", 3) == 0 ||
+      strncmp(buf, "A12:", 4) == 0 || strncmp(buf, "Current Ver", 11) == 0)
+    return;
+
+  for (int off = 0; off < n; off += COLS)
+    {
+      char seg[COLS + 1];
+      snprintf(seg, sizeof(seg), "%s", buf + off);
+      tail_push(seg);
+    }
+
+  if (!g_panic_drawn && strstr(buf, "VADDR:") != NULL)
+    {
+      g_panic_n = 0;
+      panic_line("*** CRASH *** photo this");
+      if (g_boot_n > 0)
+        panic_line("step: %s", g_boot_log[g_boot_n - 1]);
+      panic_add_tail();
+      panic_draw();
+    }
+}
+
+static int tail_syslog_putc(FAR struct syslog_channel_s *ch, int c)
+{
+  UNUSED(ch);
+  if (c == '\n') tail_line();
+  else if (c != '\r' && g_raw_len < RAW_MAX) g_raw[g_raw_len++] = (char)c;
+  return c;
+}
+
+static int tail_syslog_flush(FAR struct syslog_channel_s *ch)
+{ UNUSED(ch); return OK; }
+
+static const struct syslog_channel_ops_s g_tail_syslog_ops =
+{
+  .sc_putc  = tail_syslog_putc,
+  .sc_force = tail_syslog_putc,
+  .sc_flush = tail_syslog_flush,
+};
+static struct syslog_channel_s g_tail_syslog_channel =
+{
+  .sc_ops = &g_tail_syslog_ops,
+};
+
 static int panic_screen_cb(FAR struct notifier_block *nb,
                            unsigned long action, FAR void *data)
 {
@@ -1164,11 +1284,11 @@ static int panic_screen_cb(FAR struct notifier_block *nb,
   UNUSED(nb);
   if (g_panic_drawn || action == PANIC_KERNEL_FINAL || p == NULL)
     return 0;
-  g_panic_drawn = true;
 
   f = p->filename ? strrchr(p->filename, '/') : NULL;
   f = f ? f + 1 : (p->filename ? p->filename : "?");
 
+  g_panic_n = 0;
   panic_line("*** CRASH *** photo this");
 #if CONFIG_TASK_NAME_SIZE > 0
   panic_line("task %s", p->rtcb ? p->rtcb->name : "?");
@@ -1185,14 +1305,8 @@ static int panic_screen_cb(FAR struct notifier_block *nb,
   if (g_boot_n > 0)
     panic_line("step: %s", g_boot_log[g_boot_n - 1]);
   panic_line("--- last log ---");
-  for (int i = 1; i <= TAIL_LINES; i++)
-    {
-      FAR const char *t = g_tail[(g_tail_head + i) % TAIL_LINES];
-      if (t[0]) panic_line("%s", t);
-    }
-
-  bb_lcd_begin(false);
-  bb_frame(compose_panic);
+  panic_add_tail();
+  panic_draw();
   return 0;
 }
 
@@ -1201,6 +1315,21 @@ static struct notifier_block g_panic_nb =
   .notifier_call = panic_screen_cb,
 };
 #endif /* CARDPUTER_PANIC_SCREEN */
+
+void cardputer_early_init(void)
+{
+  board_disable_watchdogs();                 /* first: RWDT is ~1 s away */
+  g_reset_cause = (uint8_t)(REG32(RTC_RESET_STATE) & 0x3f);
+  board_clear_interrupts();
+  board_reset_peripherals();
+  bb_lcd_begin(true);
+  bb_frame(compose_early);
+  g_boot_bitbang = true;                    /* boot steps bit-banged too */
+#ifdef CARDPUTER_PANIC_SCREEN
+  syslog_channel_register(&g_tail_syslog_channel);  /* lock-free: OK here */
+#endif
+  board_arm_hang_probe();
+}
 
 /****************************************************************************
  * Vector app icons
@@ -1507,9 +1636,6 @@ static volatile bool g_usj_dead;
 static int usj_syslog_putc(FAR struct syslog_channel_s *ch, int c)
 {
   UNUSED(ch);
-#ifdef CARDPUTER_PANIC_SCREEN
-  tail_putc(c);
-#endif
   if (g_usj_dead) return c;
   for (int i = 0; i < 200000; i++)
     {
@@ -1547,9 +1673,6 @@ static struct syslog_channel_s g_usj_syslog_channel =
 static int lcd_syslog_putc(FAR struct syslog_channel_s *ch, int c)
 {
   UNUSED(ch);
-#if defined(CARDPUTER_PANIC_SCREEN) && !defined(CARDPUTER_USB_SYSLOG)
-  tail_putc(c);                              /* for the crash screen */
-#endif
   if (g_out_ring_ready) ringdev_tryputc(&g_out_ring, (char)c);
   return c;
 }
@@ -4458,8 +4581,14 @@ int esp32s3_bringup(void)
 #ifdef CARDPUTER_USB_SYSLOG
   syslog_channel_register(&g_usj_syslog_channel);  /* needs MAX_CHANNELS 4 */
 #endif
+  board_disarm_hang_probe();                 /* we got here: no hang */
 #ifdef CARDPUTER_PANIC_SCREEN
-  panic_notifier_chain_register(&g_panic_nb);
+  syslog_channel_register(&g_tail_syslog_channel);  /* no-op if early-init */
+  if (!g_panic_nb_registered)
+    {
+      panic_notifier_chain_register(&g_panic_nb);
+      g_panic_nb_registered = true;
+    }
 #endif
   board_disable_watchdogs();                 /* also without the hook */
   board_reset_peripherals();
