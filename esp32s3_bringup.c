@@ -3730,6 +3730,34 @@ static int lcd_cons_thread(int argc, FAR char *argv[])
 }
 
 /****************************************************************************
+ * board_reclaim_gpios
+ *
+ *   When another firmware starts us with a software reset -- M5 Launcher
+ *   does exactly that -- the GPIO matrix is NOT reset.  Launcher leaves:
+ *     GPIO38  backlight on LEDC PWM, duty 0 (it dims to 0 before rebooting)
+ *     GPIO8/9 keyboard bus on the hardware I2C peripheral (Wire)
+ *     GPIO11  a falling-edge GPIO interrupt (TCA8418 INT)
+ *   esp_configgpio() selects the GPIO function but keeps the old output
+ *   signal, so esp_gpiowrite() would have no effect: black screen, dead
+ *   keyboard, while NuttX itself runs fine.  Route every pin we drive by
+ *   hand back to the plain GPIO output register and drop the interrupt.
+ ****************************************************************************/
+
+#ifndef SIG_GPIO_OUT_IDX
+#  define SIG_GPIO_OUT_IDX 256               /* ESP32-S3 "simple GPIO" */
+#endif
+
+static void board_reclaim_gpios(void)
+{
+  static const uint8_t pins[] = { 8, 9, 11, 33, 34, 38, 44 };
+
+  for (size_t i = 0; i < sizeof(pins); i++)
+    esp_gpio_matrix_out(pins[i], SIG_GPIO_OUT_IDX, false, false);
+
+  esp_configgpio(11, INPUT | PULLUP);        /* also clears the INT type */
+}
+
+/****************************************************************************
  * board_lcd_initialize
  ****************************************************************************/
 
@@ -3768,6 +3796,8 @@ int board_lcd_initialize(void)
 int esp32s3_bringup(void)
 {
   int ret;
+
+  board_reclaim_gpios();                     /* before any esp_gpiowrite() */
 
 #ifdef CONFIG_FS_PROCFS
   nx_mount(NULL,"/proc","procfs",0,NULL);

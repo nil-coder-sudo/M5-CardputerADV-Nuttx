@@ -177,6 +177,15 @@ SD menu. The script refuses simple-boot images, which cannot run from an
 OTA partition. **Do not run `make flash` in this mode** — it writes NuttX's own
 bootloader and partition table and erases Launcher.
 
+**Boot behaviour under Launcher** (from Launcher's source and its
+bootloader): a power‑on reset or the reset button always starts Launcher; it
+then starts the installed app with a software reset. That software reset does
+not clear the ESP32‑S3 GPIO matrix, so Launcher's backlight PWM (GPIO38, set
+to 0 % just before the reboot) and its hardware‑I2C keyboard pins (GPIO8/9)
+would stay attached. The bring‑up takes these pins back first thing
+(`board_reclaim_gpios()`), otherwise NuttX runs with a black screen and a
+dead keyboard.
+
 Under Launcher the saved Wi‑Fi networks go to the highest flash sector that
 no partition uses; if Launcher has handed out the whole flash, networks are
 not saved and the terminal says `(not saved)`.
