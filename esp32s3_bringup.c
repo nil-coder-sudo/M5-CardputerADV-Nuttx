@@ -839,6 +839,8 @@ static void bb_lcd_begin(bool hw_reset)
 
 /* Render a whole frame with `fn` through the band buffer, bit-banged. */
 
+static volatile bool g_bb_busy;              /* a frame is being sent */
+
 static void bb_frame(compose_t fn)
 {
   const uint8_t ca[4] = { (BB_XOFF) >> 8, (BB_XOFF) & 0xff,
@@ -848,6 +850,7 @@ static void bb_frame(compose_t fn)
                           (BB_YOFF + LCD_H - 1) >> 8,
                           (BB_YOFF + LCD_H - 1) & 0xff };
 
+  g_bb_busy = true;
   bb_cmd(0x2a, ca, 4);                      /* CASET */
   bb_cmd(0x2b, ra, 4);                      /* RASET */
 
@@ -874,7 +877,64 @@ static void bb_frame(compose_t fn)
   esp_gpiowrite(PIN_LCD_CS, 1);
   g_by0 = 0;
   g_by1 = -1;
+  g_bb_busy = false;
 }
+
+/****************************************************************************
+ * Optional boot probes
+ *
+ *   CONFIG_BOARD_EARLY_INITIALIZE: a boot step right after up_initialize()
+ *   (timer, interrupts, serial up), before any thread runs.
+ *   CONFIG_SYSTEMTICK_HOOK: a seconds counter in the top-right corner,
+ *   drawn from the timer tick while the LCD is still bit-banged -- if it
+ *   counts, the OS is alive and some thread is stuck; if it doesn't, the
+ *   timer interrupt never runs (interrupts dead or an interrupt storm).
+ ****************************************************************************/
+
+#ifdef CONFIG_BOARD_EARLY_INITIALIZE
+void board_early_initialize(void)
+{
+  BTRACE("os core up\n");
+}
+#endif
+
+#ifdef CONFIG_SYSTEMTICK_HOOK
+void board_timerhook(void)
+{
+  static uint32_t ticks;
+  char txt[6];
+  const int w = 5 * 8, h = 16;
+  const int x0 = BB_XOFF + LCD_W - w, y0 = BB_YOFF;
+  uint8_t ca[4], ra[4];
+
+  if (++ticks % (1000000 / CONFIG_USEC_PER_TICK) != 0) return;
+  if (!g_boot_bitbang || g_bb_busy) return;
+
+  snprintf(txt, sizeof(txt), "%4us",
+           (unsigned)(ticks / (1000000 / CONFIG_USEC_PER_TICK)) % 10000);
+  ca[0] = x0 >> 8; ca[1] = x0 & 0xff;
+  ca[2] = (x0 + w - 1) >> 8; ca[3] = (x0 + w - 1) & 0xff;
+  ra[0] = y0 >> 8; ra[1] = y0 & 0xff;
+  ra[2] = (y0 + h - 1) >> 8; ra[3] = (y0 + h - 1) & 0xff;
+  bb_cmd(0x2a, ca, 4);
+  bb_cmd(0x2b, ra, 4);
+  esp_gpiowrite(PIN_LCD_CS, 0);
+  esp_gpiowrite(PIN_LCD_DC, 0);
+  bb_byte(0x2c);
+  esp_gpiowrite(PIN_LCD_DC, 1);
+  for (int r = 0; r < h; r++)
+    for (int c = 0; c < w; c++)
+      {
+        unsigned char u = (unsigned char)txt[c / 8];
+        uint8_t bits = (u >= GFX_FONT_FIRST && u <= GFX_FONT_LAST) ?
+          g_font8x16[(u - GFX_FONT_FIRST) * GFX_FONT_H + r] : 0;
+        uint16_t px = (bits & (0x80 >> (c % 8))) ? 0xffe0 : 0x0000;
+        bb_byte((uint8_t)(px >> 8));
+        bb_byte((uint8_t)px);
+      }
+  esp_gpiowrite(PIN_LCD_CS, 1);
+}
+#endif
 
 /* 8x8 text: the 8x16 font squashed by OR-ing row pairs (still readable),
  * 30 columns x 16 lines.
