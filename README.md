@@ -148,12 +148,23 @@ bootloader, so the image must be built in **legacy IDF format** (the default
 "simple boot" image only runs when flashed at `0x0`):
 
 ```bash
-# menuconfig: System Type → Bootloader and Image Configuration →
-#             [*] Enable legacy IDF bootloader format
-# or:
+# 1. fix NuttX's legacy linker script (once per NuttX tree, see below)
+python3 ../M5-CardputerADV-Nuttx/fix_legacy_ld.py .
+
+# 2. menuconfig: System Type → Bootloader and Image Configuration →
+#                [*] Enable legacy IDF bootloader format
+#    or:
 echo CONFIG_ESP32S3_APP_FORMAT_LEGACY=y >> .config
 make olddefconfig && make -j
 ```
+
+**Why step 1:** since the 2026‑02 ESP‑IDF HAL update, NuttX's
+`legacy_sections.ld` has no rule for the HAL's `.rtc.force_slow.*` data, so
+the linker drops it into the flash address range outside the image. The
+first write to it faults right after the bootloader starts NuttX, so the
+screen stays dark. `fix_legacy_ld.py` adds the missing rules (it is a no‑op
+on a tree that already has them), and `mk_launcher_bin.py` refuses to wrap an
+image that still has the problem.
 
 Then wrap it with the partition table Launcher expects (app at `0x10000`):
 

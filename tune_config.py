@@ -55,7 +55,7 @@ TUNE = {
     # NET_LL_IEEE80211 link type ("Unrecognized link type: 5", -22) and
     # wlan0 is never created.  Also makes netinit use wlan0, not eth0.
     "DRIVERS_IEEE80211": "y",
-    "SYSLOG_MAX_CHANNELS": "2",      # lets the LCD syslog mirror register
+    "SYSLOG_MAX_CHANNELS": "3",      # console + default + LCD mirror
     "TASK_NAME_SIZE": "15",          # was 31 (per task)
     "STACK_COLORATION": "y",         # `ps` shows real stack use -> tune
     "SYSTEM_PING": "y",              # quick Wi-Fi sanity check

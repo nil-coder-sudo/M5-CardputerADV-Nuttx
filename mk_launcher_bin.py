@@ -18,6 +18,7 @@ usage:
 """
 import argparse
 import hashlib
+import os
 import struct
 import sys
 
@@ -53,6 +54,32 @@ def check_app(img):
     return nseg
 
 
+def check_elf(path):
+    """Refuse images whose ELF has orphan .rtc.force_* output sections:
+    those crash at boot (see fix_legacy_ld.py)."""
+    try:
+        e = open(path, "rb").read()
+    except OSError:
+        return
+    if e[:4] != b"\x7fELF" or e[4] != 1:
+        return
+    shoff, = struct.unpack_from("<I", e, 0x20)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", e, 0x2e)
+    stro = struct.unpack_from("<I", e, shoff + shstrndx * shentsize + 16)[0]
+    bad = []
+    for i in range(shnum):
+        nm, = struct.unpack_from("<I", e, shoff + i * shentsize)
+        name = e[stro + nm:e.index(b"\0", stro + nm)].decode()
+        addr, = struct.unpack_from("<I", e, shoff + i * shentsize + 12)
+        if name.startswith((".rtc.force_slow.", ".rtc.force_fast.")) or (
+                name.startswith(".rtc.force_") and addr < 0x50000000):
+            bad.append(f"{name}@0x{addr:x}")
+    if bad:
+        sys.exit("error: " + ", ".join(bad) + " is an orphan section in "
+                 f"{path}; this image crashes at boot.\n"
+                 "       run: python3 fix_legacy_ld.py <nuttx dir>  and rebuild")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -63,6 +90,8 @@ def main():
 
     app = open(args.app, "rb").read()
     nseg = check_app(app)
+    elf = os.path.join(os.path.dirname(os.path.abspath(args.app)), "nuttx")
+    check_elf(elf)
     app_part = (len(app) + ALIGN - 1) // ALIGN * ALIGN
 
     table = (pt_entry(0x01, 0x02, 0x9000, 0x5000, "nvs") +
