@@ -142,16 +142,14 @@ static void boot_step(FAR const char *fmt, ...)
 #  define BTRACE(...) boot_step(__VA_ARGS__)
 #endif
 
-/* Debug builds: a crash is drawn on the LCD (bit-banged, so it works even
- * when the crash happened inside the SPI/LCD driver or before it started).
+/* A crash is drawn on the LCD (bit-banged, so it works even when the crash
+ * happened inside the SPI/LCD driver or before it started).
  */
 
-#ifdef CONFIG_DEBUG_FEATURES
-#  define CARDPUTER_PANIC_SCREEN 1
-#  include <nuttx/notifier.h>
-#  include <nuttx/panic_notifier.h>
-#  include <nuttx/sched.h>
-#endif
+#define CARDPUTER_PANIC_SCREEN 1
+#include <nuttx/notifier.h>
+#include <nuttx/panic_notifier.h>
+#include <nuttx/sched.h>
 
 /****************************************************************************
  * Tunables  (override with -D or edit here)
@@ -690,10 +688,8 @@ static void gtext_right(int rx, int y, FAR const char *s, uint16_t fg)
 static char          g_boot_log[BOOT_LINES][COLS + 1];
 static int           g_boot_n;
 static volatile bool g_boot_screen = true;   /* until the menu takes over */
-#ifdef CONFIG_DEBUG_FEATURES
 static bool          g_boot_bitbang;         /* LCD pins are plain GPIOs */
 static void bb_frame(void (*fn)(void));
-#endif
 
 static void compose_boot(void)
 {
@@ -731,10 +727,8 @@ static void boot_step(FAR const char *fmt, ...)
       snprintf(g_boot_log[g_boot_n++], sizeof(g_boot_log[0]), "%s", line);
       if (g_gfx_ready)
         gfx_render_all(compose_boot);
-#ifdef CONFIG_DEBUG_FEATURES
       else if (g_boot_bitbang)
         bb_frame(compose_boot);              /* LCD driver not up yet */
-#endif
     }
   nxmutex_unlock(&g_con_mutex);
 }
@@ -1046,19 +1040,13 @@ void cardputer_early_init(void)
   g_reset_cause = (uint8_t)(REG32(RTC_RESET_STATE) & 0x3f);
   board_clear_interrupts();
   board_reset_peripherals();
-#ifdef CONFIG_DEBUG_FEATURES
   bb_lcd_begin(true);
   bb_frame(compose_early);
   g_boot_bitbang = true;                    /* boot steps bit-banged too */
-#else
-  esp_configgpio(PIN_LCD_BL, OUTPUT);
-  esp_gpio_matrix_out(PIN_LCD_BL, SIG_GPIO_OUT_IDX, false, false);
-  esp_gpiowrite(PIN_LCD_BL, 1);
-#endif
 }
 
 /****************************************************************************
- * Panic screen (debug builds)
+ * Panic screen
  *
  *   The last syslog lines are kept in a small ring; on a panic they are
  *   drawn in red together with the task, file:line and PC.
@@ -1499,6 +1487,9 @@ static struct syslog_channel_s g_usj_syslog_channel =
 static int lcd_syslog_putc(FAR struct syslog_channel_s *ch, int c)
 {
   UNUSED(ch);
+#if defined(CARDPUTER_PANIC_SCREEN) && !defined(CARDPUTER_USB_SYSLOG)
+  tail_putc(c);                              /* for the crash screen */
+#endif
   if (g_out_ring_ready) ringdev_tryputc(&g_out_ring, (char)c);
   return c;
 }
@@ -4245,12 +4236,13 @@ static int lcd_cons_thread(int argc, FAR char *argv[])
 
   UNUSED(argc); UNUSED(argv);
 
-  BTRACE("lcd_cons: first frame\n");
+  BTRACE("battery read...\n");
+  battery_refresh();
+  BTRACE("battery ok\n");
 #ifdef CONFIG_DEBUG_FEATURES
   usleep(3000 * 1000);                       /* leave the boot log readable */
 #endif
   boot_screen_end();
-  battery_refresh();
   con_clear_full();
   menu_render();
   BTRACE("lcd_cons: menu drawn\n");
@@ -4375,9 +4367,7 @@ int board_lcd_initialize(void)
 
   spi=esp32s3_spibus_initialize(2);
   if (!spi) return -ENODEV;
-#ifdef CONFIG_DEBUG_FEATURES
   g_boot_bitbang = false;                    /* SPI2 owns the pins now */
-#endif
   BTRACE("spi2 ok, st7789 init...\n");
 
   g_lcddev=st7789_lcdinitialize(spi);

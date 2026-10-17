@@ -222,8 +222,7 @@ restart from Launcher, 9/16 = RTC watchdog).
 
 **Finding out where a boot stops (no PC needed).** Every bring-up step is
 listed on a *NuttX boot* screen until the menu appears, so a boot that hangs
-shows the last step reached. With `CONFIG_DEBUG_FEATURES=y` and the hook
-above you also get:
+shows the last step reached. With the hook above (any build) you also get:
 
 | What the screen shows | Meaning |
 |---|---|
@@ -234,7 +233,8 @@ above you also get:
 
 The early screen and the crash screen drive the LCD with bit-banged GPIOs,
 so they work even when the SPI/LCD drivers are not up or are what crashed.
-Without the debug option, the hook does the clean-up and switches the backlight on.
+`CONFIG_DEBUG_FEATURES=y` adds a 3 s pause on the boot list, mirrors syslog
+to the USB cable and puts the last log lines on the crash screen.
 
 ### 6. (Optional) Serial monitor
 
