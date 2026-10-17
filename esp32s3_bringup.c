@@ -134,6 +134,16 @@ FAR struct mtd_dev_s *esp_spiflash_alloc_mtdpart(uint32_t mtd_offset,
 static void boot_step(FAR const char *fmt, ...)
   __attribute__((format(printf, 1, 2)));
 
+/* Boot "breadcrumb" in RTC slow memory (survives a watchdog reset). */
+
+#define RTC_BC_ADDR  0x50001ff0u
+#define BC_MAGIC     0xbc000000u
+#ifdef CARDPUTER_HOST_TEST
+#  define bc_set(n)  ((void)(n))
+#else
+#  define bc_set(n)  (*(volatile uint32_t *)RTC_BC_ADDR = BC_MAGIC | (n))
+#endif
+
 #ifdef CONFIG_DEBUG_FEATURES
 #  define BTRACE(...) \
      do { syslog(LOG_ERR, "cardputer: " __VA_ARGS__); \
@@ -707,6 +717,7 @@ static void boot_step(FAR const char *fmt, ...)
   size_t n;
 
   if (!g_boot_screen) return;
+  bc_set(100 + g_boot_n);
 
   va_start(ap, fmt);
   vsnprintf(line, sizeof(line), fmt, ap);
@@ -1091,24 +1102,31 @@ static void board_disable_watchdogs(void)
 #define CPUINT_NMI         14
 #define SYS_PERIP_CLK_EN0  0x600c0018u
 
-static void board_arm_hang_probe(void)
+
+/* Reset probe (diagnostic builds, CONFIG_BOARD_EARLY_INITIALIZE): the
+ * RTC watchdog -- independent of the CPU, so it fires even when the CPU is
+ * stalled on a bus access -- is armed for ~9 s with a system reset.  RTC
+ * memory survives that reset, and so does the "breadcrumb" word that the
+ * patched NuttX start-up and every boot step write: the next start shows
+ * the last step the hung boot reached.  The bring-up disarms the watchdog.
+ */
+
+#define RTC_WDTCONFIG1     0x6000809cu
+
+static uint32_t g_last_bc;
+
+#ifdef CONFIG_BOARD_EARLY_INITIALIZE
+static void board_arm_reset_probe(void)
 {
-  REG32(SYS_PERIP_CLK_EN0) |= 1u << 15;      /* TIMERGROUP1 clock */
-  REG32(SYS_PERIP_RST_EN0) &= ~(1u << 15);
-
-  REG32(TIMG_WDTWPROTECT(TG1_BASE)) = WDT_WKEY;
-  REG32(TIMG_WDTCONFIG0(TG1_BASE))  = 0;
-  REG32(TG1_BASE + 0x4c) = 40000u << 16;     /* 80 MHz / 40000 = 2 kHz */
-  REG32(TG1_BASE + 0x50) = 16000;            /* stage 0: 8 s */
-  REG32(TIMG_WDTCONFIG0(TG1_BASE)) = (1u << 31) | (1u << 29) |
-                                     (7u << 18) | (7u << 15);
-  REG32(TG1_BASE + 0x60) = 1;                /* feed: start counting now */
-  REG32(TIMG_WDTWPROTECT(TG1_BASE)) = 0;
-
-  REG32(TG1_BASE + 0x7c)  = 1u << 2;         /* clear, then enable WDT int */
-  REG32(TG1_BASE + 0x70) |= 1u << 2;
-  REG32(INTMTX_CORE0_BASE + 4 * TG1_WDT_SOURCE) = CPUINT_NMI;
+  REG32(RTC_WDTWPROTECT) = WDT_WKEY;
+  REG32(RTC_WDTCONFIG0)  = 0;
+  REG32(RTC_WDTCONFIG1)  = 1200000;          /* ~9 s of the ~136 kHz clock */
+  REG32(RTC_WDTCONFIG0)  = (1u << 31) | (3u << 28) | (7u << 16) |
+                           (7u << 13) | (1u << 11);
+  REG32(RTC_WDTFEED)     = 1u << 31;
+  REG32(RTC_WDTWPROTECT) = 0;
 }
+#endif
 
 static void board_disarm_hang_probe(void)
 {
@@ -1134,6 +1152,12 @@ static void compose_early(void)
   gtext(8, 56, "(early init)", 0xffff);
   snprintf(buf, sizeof(buf), "reset cause %u", g_reset_cause);
   gtext(8, 88, buf, 0xffe0);
+  if ((g_last_bc & 0xff000000u) == BC_MAGIC)
+    {
+      snprintf(buf, sizeof(buf), "last run: step %u",
+               (unsigned)(g_last_bc & 0xffff));
+      gtext(8, 108, buf, 0xffe0);
+    }
 }
 
 /****************************************************************************
@@ -1320,6 +1344,8 @@ void cardputer_early_init(void)
 {
   board_disable_watchdogs();                 /* first: RWDT is ~1 s away */
   g_reset_cause = (uint8_t)(REG32(RTC_RESET_STATE) & 0x3f);
+  g_last_bc = REG32(RTC_BC_ADDR);
+  bc_set(30);
   board_clear_interrupts();
   board_reset_peripherals();
   bb_lcd_begin(true);
@@ -1328,7 +1354,10 @@ void cardputer_early_init(void)
 #ifdef CARDPUTER_PANIC_SCREEN
   syslog_channel_register(&g_tail_syslog_channel);  /* lock-free: OK here */
 #endif
-  board_arm_hang_probe();
+#ifdef CONFIG_BOARD_EARLY_INITIALIZE
+  board_arm_reset_probe();
+#endif
+  bc_set(31);
 }
 
 /****************************************************************************
