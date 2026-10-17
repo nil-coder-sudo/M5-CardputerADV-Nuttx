@@ -95,6 +95,17 @@ This firmware lives in the board bring‑up source:
 nuttx/boards/xtensa/esp32s3/esp32s3-devkit/src/esp32s3_bringup.c
 ```
 
+In the same directory, `esp32s3-devkit.h` must use the Cardputer's LCD
+pins (the devkit default is the ST7735 wiring, DC = 14, which leaves the
+screen black because every command reaches the panel as data):
+
+```c
+#define GPIO_LCD_DC         34
+#define GPIO_LCD_RST        33
+```
+
+The bring-up refuses to compile with any other DC pin.
+
 Make sure your build is configured so that `CONFIG_LCD`, the ST7789 driver,
 the ADC, and SPIFLASH (if used) are enabled. For Wi‑Fi the bring‑up calls
 `board_wlan_init()` whenever `CONFIG_ESPRESSIF_WIFI` is set. The bring‑up code registers two

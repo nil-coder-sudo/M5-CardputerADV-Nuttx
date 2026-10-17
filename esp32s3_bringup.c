@@ -66,6 +66,18 @@
 #include <arch/board/board.h>
 #include "espressif/esp_gpio.h"
 #include "esp32s3_start.h"
+#include "esp32s3-devkit.h"
+
+/* The ST7789 driver switches command/data through the board's
+ * esp32s3_spi2_cmddata(), which drives GPIO_LCD_DC.  The devkit header
+ * says 14 (its ST7735 wiring); on the Cardputer the DC line is GPIO34.
+ * With the wrong pin every command reaches the panel as data and the
+ * screen stays black while everything else runs.
+ */
+
+#if defined(GPIO_LCD_DC) && GPIO_LCD_DC != 34
+#  error "Set GPIO_LCD_DC to 34 (and GPIO_LCD_RST to 33) in boards/xtensa/esp32s3/esp32s3-devkit/src/esp32s3-devkit.h"
+#endif
 
 #if defined(CONFIG_ESPRESSIF_ADC) || defined(CONFIG_ESP32S3_ADC)
 #  include "esp32s3_board_adc.h"
