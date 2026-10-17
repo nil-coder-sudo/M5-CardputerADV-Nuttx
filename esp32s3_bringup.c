@@ -138,6 +138,10 @@ static void boot_step(FAR const char *fmt, ...)
 
 #define RTC_BC_ADDR  0x50001ff0u
 #define BC_MAGIC     0xbc000000u
+#define BC_MENU      200                     /* boot finished */
+static void board_disable_rwdt(void);
+static void boot_step_save(FAR const char *txt);
+
 #ifdef CARDPUTER_HOST_TEST
 #  define bc_set(n)  ((void)(n))
 #else
@@ -725,6 +729,7 @@ static void boot_step(FAR const char *fmt, ...)
   n = strlen(line);
   while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
     line[--n] = '\0';
+  boot_step_save(line);
 
   nxmutex_lock(&g_con_mutex);
   if (g_boot_screen)
@@ -751,6 +756,8 @@ static void boot_screen_end(void)
   nxmutex_lock(&g_con_mutex);
   g_boot_screen = false;
   nxmutex_unlock(&g_con_mutex);
+  bc_set(BC_MENU);
+  board_disable_rwdt();                      /* booted: boot watchdog off */
 }
 
 /****************************************************************************
@@ -1075,14 +1082,21 @@ static void board_clear_interrupts(void)
 
 static uint8_t g_reset_cause;                /* RTC_CNTL reset reason */
 
-static void board_disable_watchdogs(void)
+static void board_disable_rwdt(void)
 {
-  static const uint32_t timg[] = { 0x6001f000u, 0x60020000u };
-
   REG32(RTC_WDTWPROTECT) = WDT_WKEY;
   REG32(RTC_WDTFEED)     = 1u << 31;
   REG32(RTC_WDTCONFIG0) &= ~((1u << 31) | (1u << 12));  /* EN, FLASHBOOT */
   REG32(RTC_WDTWPROTECT) = 0;
+}
+
+/* Everything except the RTC watchdog, which the boot watchdog below may
+ * be using.
+ */
+
+static void board_disable_other_watchdogs(void)
+{
+  static const uint32_t timg[] = { 0x6001f000u, 0x60020000u };
 
   for (size_t i = 0; i < sizeof(timg) / sizeof(timg[0]); i++)
     {
@@ -1096,34 +1110,28 @@ static void board_disable_watchdogs(void)
   REG32(RTC_SWD_WPROTECT) = 0;
 }
 
-/* Hang probe.  Timer-group 1's watchdog is armed at early init with an
- * 8 s first stage that raises an interrupt routed to CPU interrupt 14, the
- * Xtensa NMI: it cannot be masked, so it fires even when interrupts are off
- * or an interrupt storm keeps the CPU busy.  NuttX turns an NMI into a
- * panic, and the panic screen then shows the PC where the CPU was stuck.
- * The bring-up disarms it as its first step.
- */
+static void board_disable_watchdogs(void)
+{
+  board_disable_rwdt();
+  board_disable_other_watchdogs();
+}
 
-#define TG1_BASE           0x60020000u
-#define TG1_WDT_SOURCE     55                /* ESP32S3_PERIPH_TG1_WDT_LEVEL */
-#define CPUINT_NMI         14
-#define SYS_PERIP_CLK_EN0  0x600c0018u
-
-
-/* Reset probe (diagnostic builds, CONFIG_BOARD_EARLY_INITIALIZE): the
- * RTC watchdog -- independent of the CPU, so it fires even when the CPU is
- * stalled on a bus access -- is armed for ~9 s with a system reset.  RTC
- * memory survives that reset, and so does the "breadcrumb" word that the
- * patched NuttX start-up and every boot step write: the next start shows
- * the last step the hung boot reached.  The bring-up disarms the watchdog.
+/* Boot watchdog.  The RTC watchdog -- independent of the CPU, so it fires
+ * even when the CPU is stalled on a bus access -- is armed at early init
+ * for ~9 s with a system reset and fed by every boot step; the menu
+ * disarms it.  RTC slow memory survives that reset, and so do the
+ * "breadcrumb" (step number) and the text of the last boot step, which the
+ * next start shows on the early screen.  A hung boot therefore restarts by
+ * itself and says where it hung.
  */
 
 #define RTC_WDTCONFIG1     0x6000809cu
+#define RTC_STEP_TXT       0x50001f00u       /* 32 bytes, RTC slow memory */
 
 static uint32_t g_last_bc;
+static char     g_last_step[COLS + 1];
 
-#ifdef CONFIG_BOARD_EARLY_INITIALIZE
-static void board_arm_reset_probe(void)
+static void board_boot_wdt_arm(void)
 {
   REG32(RTC_WDTWPROTECT) = WDT_WKEY;
   REG32(RTC_WDTCONFIG0)  = 0;
@@ -1133,17 +1141,27 @@ static void board_arm_reset_probe(void)
   REG32(RTC_WDTFEED)     = 1u << 31;
   REG32(RTC_WDTWPROTECT) = 0;
 }
-#endif
 
-static void board_disarm_hang_probe(void)
+static void board_boot_wdt_feed(void)
 {
-  REG32(INTMTX_CORE0_BASE + 4 * TG1_WDT_SOURCE) = INTMTX_INVALID;
-  REG32(TIMG_WDTWPROTECT(TG1_BASE)) = WDT_WKEY;
-  REG32(TIMG_WDTCONFIG0(TG1_BASE)) &= ~((1u << 31) | (1u << 14));
-  REG32(TIMG_WDTWPROTECT(TG1_BASE)) = 0;
-  REG32(TG1_BASE + 0x70) &= ~(1u << 2);
-  REG32(TG1_BASE + 0x7c)  = 1u << 2;
+  REG32(RTC_WDTWPROTECT) = WDT_WKEY;
+  REG32(RTC_WDTFEED)     = 1u << 31;
+  REG32(RTC_WDTWPROTECT) = 0;
 }
+
+static void boot_step_save(FAR const char *txt)
+{
+#ifndef CARDPUTER_HOST_TEST
+  volatile char *d = (volatile char *)RTC_STEP_TXT;
+  int i = 0;
+  for (; i < COLS && txt[i]; i++) d[i] = txt[i];
+  d[i] = '\0';
+  board_boot_wdt_feed();
+#else
+  UNUSED(txt);
+#endif
+}
+
 
 /* Very first thing NuttX does (called from esp32s3_board_initialize(),
  * before the OS starts): light the backlight and draw a frame.  If this
@@ -1159,11 +1177,11 @@ static void compose_early(void)
   gtext(8, 56, "(early init)", 0xffff);
   snprintf(buf, sizeof(buf), "reset cause %u", g_reset_cause);
   gtext(8, 88, buf, 0xffe0);
-  if ((g_last_bc & 0xff000000u) == BC_MAGIC)
+  if ((g_last_bc & 0xff000000u) == BC_MAGIC &&
+      (g_last_bc & 0xffff) != BC_MENU && g_last_step[0])
     {
-      snprintf(buf, sizeof(buf), "last run: step %u",
-               (unsigned)(g_last_bc & 0xffff));
-      gtext(8, 108, buf, 0xffe0);
+      gtext(8, 104, "last boot hung at:", 0xffe0);
+      gtext(8, 119, g_last_step, 0xffe0);
     }
 }
 
@@ -1352,6 +1370,13 @@ void cardputer_early_init(void)
   board_disable_watchdogs();                 /* first: RWDT is ~1 s away */
   g_reset_cause = (uint8_t)(REG32(RTC_RESET_STATE) & 0x3f);
   g_last_bc = REG32(RTC_BC_ADDR);
+  for (int i = 0; i < COLS; i++)
+    {
+      char c = ((volatile char *)RTC_STEP_TXT)[i];
+      g_last_step[i] = (c >= 32 && c < 127) ? c : '\0';
+      if (!c) break;
+    }
+  ((volatile char *)RTC_STEP_TXT)[0] = '\0';
   bc_set(30);
   board_clear_interrupts();
   board_reset_peripherals();
@@ -1361,9 +1386,7 @@ void cardputer_early_init(void)
 #ifdef CARDPUTER_PANIC_SCREEN
   syslog_channel_register(&g_tail_syslog_channel);  /* lock-free: OK here */
 #endif
-#ifdef CONFIG_BOARD_EARLY_INITIALIZE
-  board_arm_reset_probe();
-#endif
+  board_boot_wdt_arm();
   bc_set(31);
 }
 
@@ -4584,16 +4607,19 @@ int board_lcd_initialize(void)
   up_mdelay(50); esp_gpiowrite(33,1); up_mdelay(120);
   esp_configgpio(34,OUTPUT); esp_gpiowrite(34,1);
 
+  g_boot_bitbang = false;                    /* panel reset; SPI2 next */
+  BTRACE("lcd: spi2 init...\n");
   spi=esp32s3_spibus_initialize(2);
   if (!spi) return -ENODEV;
-  g_boot_bitbang = false;                    /* SPI2 owns the pins now */
-  BTRACE("spi2 ok, st7789 init...\n");
+  BTRACE("lcd: st7789 init...\n");
 
   g_lcddev=st7789_lcdinitialize(spi);
   if (!g_lcddev) return -ENODEV;
 
+  BTRACE("lcd: power on...\n");
   if (g_lcddev->setpower)
     g_lcddev->setpower(g_lcddev,CONFIG_LCD_MAXPOWER);
+  BTRACE("lcd: gfx init...\n");
 
   if (gfx_init()<0)
     {
@@ -4617,7 +4643,6 @@ int esp32s3_bringup(void)
 #ifdef CARDPUTER_USB_SYSLOG
   syslog_channel_register(&g_usj_syslog_channel);  /* needs MAX_CHANNELS 4 */
 #endif
-  board_disarm_hang_probe();                 /* we got here: no hang */
 #ifdef CARDPUTER_PANIC_SCREEN
   syslog_channel_register(&g_tail_syslog_channel);  /* no-op if early-init */
   if (!g_panic_nb_registered)
@@ -4626,7 +4651,8 @@ int esp32s3_bringup(void)
       g_panic_nb_registered = true;
     }
 #endif
-  board_disable_watchdogs();                 /* also without the hook */
+  board_disable_other_watchdogs();
+  board_boot_wdt_arm();                      /* (re)start the boot watchdog */
   board_reset_peripherals();
   BTRACE("bringup start (rst %u)\n", g_reset_cause);
   board_reclaim_gpios();                     /* before any esp_gpiowrite() */
