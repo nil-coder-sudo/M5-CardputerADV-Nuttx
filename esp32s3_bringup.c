@@ -125,6 +125,14 @@ FAR struct mtd_dev_s *esp_spiflash_alloc_mtdpart(uint32_t mtd_offset,
                                                  uint32_t mtd_size);
 #endif
 
+/* Boot trace, only in CONFIG_DEBUG_FEATURES builds (goes to the console). */
+
+#ifdef CONFIG_DEBUG_FEATURES
+#  define BTRACE(...) syslog(LOG_ERR, "cardputer: " __VA_ARGS__)
+#else
+#  define BTRACE(...)
+#endif
+
 /****************************************************************************
  * Tunables  (override with -D or edit here)
  ****************************************************************************/
@@ -938,6 +946,58 @@ static const struct file_operations g_out_ops =
 /****************************************************************************
  * Syslog → LCD
  ****************************************************************************/
+
+/* Debug builds: mirror syslog -- including panic/assert dumps, which use
+ * the polled "force" path -- to the USB cable (USB-Serial-JTAG), so a crash
+ * can be read on a PC with any serial terminal even when the console UART
+ * (GPIO43/44) is not wired out.  Never blocks: if no host reads the port
+ * the output is dropped.
+ */
+
+#if defined(CONFIG_SYSLOG) && defined(CONFIG_DEBUG_FEATURES)
+#  define CARDPUTER_USB_SYSLOG 1
+#  define USJ_EP1_REG       0x60038000u
+#  define USJ_EP1_CONF_REG  0x60038004u
+#  define USJ_WR_DONE       (1u << 0)
+#  define USJ_IN_FREE       (1u << 1)
+
+static volatile bool g_usj_dead;
+
+static int usj_syslog_putc(FAR struct syslog_channel_s *ch, int c)
+{
+  UNUSED(ch);
+  if (g_usj_dead) return c;
+  for (int i = 0; i < 200000; i++)
+    {
+      if (*(volatile uint32_t *)USJ_EP1_CONF_REG & USJ_IN_FREE)
+        {
+          *(volatile uint32_t *)USJ_EP1_REG = (uint32_t)(c & 0xff);
+          *(volatile uint32_t *)USJ_EP1_CONF_REG = USJ_WR_DONE;
+          return c;
+        }
+    }
+  g_usj_dead = true;                         /* nobody listening */
+  return c;
+}
+
+static int usj_syslog_flush(FAR struct syslog_channel_s *ch)
+{
+  UNUSED(ch);
+  *(volatile uint32_t *)USJ_EP1_CONF_REG = USJ_WR_DONE;
+  return OK;
+}
+
+static const struct syslog_channel_ops_s g_usj_syslog_ops =
+{
+  .sc_putc  = usj_syslog_putc,
+  .sc_force = usj_syslog_putc,
+  .sc_flush = usj_syslog_flush,
+};
+static struct syslog_channel_s g_usj_syslog_channel =
+{
+  .sc_ops = &g_usj_syslog_ops,
+};
+#endif
 
 #ifdef CONFIG_SYSLOG
 static int lcd_syslog_putc(FAR struct syslog_channel_s *ch, int c)
@@ -3464,7 +3524,12 @@ static int kbd_nsh_thread(int argc, FAR char *argv[])
   esp_configgpio(11,INPUT|PULLUP);
   usleep(300 * 1000);
 
-  if (!soft_tca8418_write(0x01,0x80)) return -ENODEV;
+  if (!soft_tca8418_write(0x01,0x80))
+    {
+      BTRACE("kbd: TCA8418 not answering on GPIO8/9\n");
+      return -ENODEV;
+    }
+  BTRACE("kbd: TCA8418 ok\n");
   soft_tca8418_write(0x11,0xFF); soft_tca8418_write(0x12,0xFF);
   soft_tca8418_write(0x13,0x03); soft_tca8418_write(0x1D,0xFF);
   soft_tca8418_write(0x1E,0xFF); soft_tca8418_write(0x29,0xFF);
@@ -3650,9 +3715,11 @@ static int lcd_cons_thread(int argc, FAR char *argv[])
 
   UNUSED(argc); UNUSED(argv);
 
+  BTRACE("lcd_cons: first frame\n");
   battery_refresh();
   con_clear_full();
   menu_render();
+  BTRACE("lcd_cons: menu drawn\n");
 
   while (1)
     {
@@ -3797,7 +3864,12 @@ int esp32s3_bringup(void)
 {
   int ret;
 
+#ifdef CARDPUTER_USB_SYSLOG
+  syslog_channel_register(&g_usj_syslog_channel);  /* needs MAX_CHANNELS 4 */
+#endif
+  BTRACE("bringup start\n");
   board_reclaim_gpios();                     /* before any esp_gpiowrite() */
+  BTRACE("gpios reclaimed\n");
 
 #ifdef CONFIG_FS_PROCFS
   nx_mount(NULL,"/proc","procfs",0,NULL);
@@ -3826,11 +3898,13 @@ int esp32s3_bringup(void)
 #ifdef CONFIG_ESPRESSIF_WIFI
   ret=board_wlan_init();
   g_wlan_init_ret=ret;
+  BTRACE("board_wlan_init %d\n", ret);
   if (ret<0) syslog(LOG_ERR,"board_wlan_init failed: %d\n",ret);
 #endif
 
 #if defined(CONFIG_LCD)
   ret=board_lcd_initialize();
+  BTRACE("board_lcd_initialize %d\n", ret);
   if (ret<0) return ret;
 
   ringdev_init(&g_kbd_ring, g_kbd_buf, sizeof(g_kbd_buf));
@@ -3856,6 +3930,7 @@ int esp32s3_bringup(void)
 
   kthread_create("lcd_cons",110,CARDPUTER_LCDCONS_STACK,lcd_cons_thread,NULL);
   kthread_create("kbd_nsh", 100,CARDPUTER_KBD_STACK,   kbd_nsh_thread, NULL);
+  BTRACE("threads started\n");
 
 #ifdef CARDPUTER_WIFI_STORE
   /* One-shot: reconnect to a saved network, DHCP, NTP; then exits. */
