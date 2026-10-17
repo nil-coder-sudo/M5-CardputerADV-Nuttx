@@ -1036,6 +1036,13 @@ static void board_clear_interrupts(void)
   *(volatile uint32_t *)GPIO_STATUS_W1TC  = 0xffffffffu;
   *(volatile uint32_t *)GPIO_STATUS1_W1TC = 0x0003ffffu;
 
+  /* RTC_CNTL interrupts (brown-out, RTC WDT, sleep, ...) live in the RTC
+   * domain, which no software reset touches.
+   */
+
+  *(volatile uint32_t *)0x60008040u = 0;               /* INT_ENA */
+  *(volatile uint32_t *)0x6000804cu = 0xffffffffu;     /* INT_CLR */
+
   for (int i = 0; i < INTMTX_NSOURCES; i++)
     {
       *(volatile uint32_t *)(INTMTX_CORE0_BASE + 4 * i) = INTMTX_INVALID;
