@@ -3056,6 +3056,29 @@ static void wifi_parse_scan(FAR struct wifi_ui_s *w,
   if (have) wifi_add_ap(w, &cur);
 }
 
+/* NuttX's ESP Wi-Fi driver keeps retrying a failed association forever
+ * (g_sta_reconnect), and while the station is connecting the ESP firmware
+ * refuses to scan (ESP_ERR_WIFI_STATE -> "scan failed (-1)").  Stop that
+ * after a failed join and before scanning while not associated.
+ */
+
+#ifdef CONFIG_ESPRESSIF_WIFI
+int esp_wifi_sta_disconnect(bool allow_reconnect);
+int esp_wifi_scan_start(FAR const void *config, bool block);
+int esp_wifi_scan_stop(void);
+#endif
+
+static int g_scan_esp_err;                   /* last raw ESP scan error */
+
+static void wifi_stop_reconnect(void)
+{
+#ifdef CONFIG_ESPRESSIF_WIFI
+  esp_wifi_sta_disconnect(false);
+#endif
+}
+
+static int wifi_set_up(void);
+
 static int wifi_do_scan(FAR struct wifi_ui_s *w)
 {
   struct socket s;
@@ -3065,13 +3088,33 @@ static int wifi_do_scan(FAR struct wifi_ui_s *w)
   int           ret;
 
   w->nap = 0; w->sel = 0; w->top = 0;
+  g_scan_esp_err = 0;
+
+  if (w->cur_ssid[0] == '\0') wifi_stop_reconnect();
 
   ret = wifi_sock(&s);
   if (ret < 0) return ret;
 
-  memset(&iwr, 0, sizeof(iwr));
-  wifi_ifname(iwr.ifr_name);
-  ret = psock_ioctl(&s, SIOCSIWSCAN, (unsigned long)(uintptr_t)&iwr);
+  for (int attempt = 0; attempt < 2; attempt++)
+    {
+      memset(&iwr, 0, sizeof(iwr));
+      wifi_ifname(iwr.ifr_name);
+      ret = psock_ioctl(&s, SIOCSIWSCAN, (unsigned long)(uintptr_t)&iwr);
+      if (ret >= 0) break;
+
+#ifdef CONFIG_ESPRESSIF_WIFI
+      /* The driver folds every ESP error into -1; ask the firmware itself
+       * so the screen can show the real code (0x3002 not started, 0x3006
+       * busy connecting, ...), then retry once.
+       */
+
+      g_scan_esp_err = esp_wifi_scan_start(NULL, false);
+      if (g_scan_esp_err == 0) esp_wifi_scan_stop();
+      if (g_scan_esp_err == 0x3002) wifi_set_up();
+      else wifi_stop_reconnect();
+#endif
+      usleep(300 * 1000);
+    }
 
   /* The driver blocks until the scan is done.  A NULL buffer asks for the
    * result size (-E2BIG); the second call copies and frees the driver's
@@ -3614,7 +3657,11 @@ static void wifi_scan(FAR struct wifi_ui_s *w)
 {
   ui_render(wifi_scanning_compose);
   int ret = wifi_do_scan(w);
-  if (ret < 0) snprintf(w->msg, sizeof(w->msg), "scan failed (%d)", ret);
+  if (ret < 0 && g_scan_esp_err != 0)
+    snprintf(w->msg, sizeof(w->msg), "scan failed (%d, %x)", ret,
+             (unsigned)g_scan_esp_err);
+  else if (ret < 0)
+    snprintf(w->msg, sizeof(w->msg), "scan failed (%d)", ret);
   else         w->msg[0] = '\0';
   wifi_mark_saved(w);
   wifi_status_refresh(w);
@@ -3687,6 +3734,7 @@ static int wifi_join(FAR const char *ssid, FAR const char *pass, size_t plen)
     }
 
   psock_close(&s);
+  if (ret < 0) wifi_stop_reconnect();        /* don't retry in background */
   return ret;
 }
 
