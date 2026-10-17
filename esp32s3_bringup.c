@@ -1087,7 +1087,7 @@ static void board_disable_watchdogs(void)
  */
 
 #define TG1_BASE           0x60020000u
-#define TG1_WDT_SOURCE     51                /* ETS_TG1_WDT_LEVEL_INTR_SOURCE */
+#define TG1_WDT_SOURCE     55                /* ESP32S3_PERIPH_TG1_WDT_LEVEL */
 #define CPUINT_NMI         14
 #define SYS_PERIP_CLK_EN0  0x600c0018u
 
