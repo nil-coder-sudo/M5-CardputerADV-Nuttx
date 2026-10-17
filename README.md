@@ -190,6 +190,33 @@ Under Launcher the saved Wi‑Fi networks go to the highest flash sector that
 no partition uses; if Launcher has handed out the whole flash, networks are
 not saved and the terminal says `(not saved)`.
 
+**Finding out where a boot stops (no PC needed).** Every bring-up step is
+listed on a *NuttX boot* screen until the menu appears, so a boot that hangs
+shows the last step reached. For more, build with `CONFIG_DEBUG_FEATURES=y`
+and add one line to `esp32s3_board_initialize()` in
+`boards/xtensa/esp32s3/esp32s3-devkit/src/esp32s3_boot.c`:
+
+```c
+void esp32s3_board_initialize(void)
+{
+  extern void cardputer_early_init(void);
+  cardputer_early_init();
+}
+```
+
+Then:
+
+| What the screen shows | Meaning |
+|---|---|
+| stays completely dark | NuttX never got control: install/bootloader problem |
+| blue **NuttX started (early init)** only | crashed or hung between early init and the bring-up |
+| green **NuttX boot** list, stops at a line | hung in that step |
+| red **\*\*\* CRASH \*\*\*** screen | a crash: task, file:line, PC and the last log lines |
+
+The early screen and the crash screen drive the LCD with bit-banged GPIOs,
+so they work even when the SPI/LCD drivers are not up or are what crashed.
+Without the debug option, the hook only switches the backlight on.
+
 ### 6. (Optional) Serial monitor
 
 A serial console is handy for debugging the boot sequence:
@@ -405,7 +432,7 @@ is full, after which it scrolls. This is intentional, not a glitch.
 |---------|--------------------|
 | Blank / black screen | Check `CONFIG_LCD` and the ST7789 driver are enabled; verify SPI bus 2 wiring and the reset/backlight GPIOs in `board_lcd_initialize`. |
 | `gfx_init failed` in the log | The LCD plane exposes neither `putarea` nor `putrun`; confirm the ST7789 driver build. |
-| No key input | The TCA8418 didn't initialise (software I²C on GPIO8/9). Check the `kbd_nsh` thread returned `-ENODEV` in the serial log. |
+| No key input | The TCA8418 isn't answering on GPIO8/9. The boot screen shows `kbd: no TCA8418, retrying`; the driver keeps retrying (with an I²C bus recovery each time). |
 | Battery shows **N/A** / FAILED | `/dev/adc0` is missing or ADC isn't enabled — enable the ESP32‑S3 ADC and re‑flash. |
 | Typing feels laggy / repeats | A ~100 ms per‑key cooldown debounces the matrix; this is expected, not a fault. |
 | Flash fails to connect | Hold **G0** during reset to force download mode, lower the baud rate, or try a different USB cable/port. |

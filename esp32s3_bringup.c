@@ -79,6 +79,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -125,12 +126,31 @@ FAR struct mtd_dev_s *esp_spiflash_alloc_mtdpart(uint32_t mtd_offset,
                                                  uint32_t mtd_size);
 #endif
 
-/* Boot trace, only in CONFIG_DEBUG_FEATURES builds (goes to the console). */
+/* Boot trace.  Every step is listed on the LCD boot screen (all builds) so
+ * a boot that stops shows *where* it stops with no PC attached; debug
+ * builds also send it to syslog.
+ */
+
+static void boot_step(FAR const char *fmt, ...)
+  __attribute__((format(printf, 1, 2)));
 
 #ifdef CONFIG_DEBUG_FEATURES
-#  define BTRACE(...) syslog(LOG_ERR, "cardputer: " __VA_ARGS__)
+#  define BTRACE(...) \
+     do { syslog(LOG_ERR, "cardputer: " __VA_ARGS__); \
+          boot_step(__VA_ARGS__); } while (0)
 #else
-#  define BTRACE(...)
+#  define BTRACE(...) boot_step(__VA_ARGS__)
+#endif
+
+/* Debug builds: a crash is drawn on the LCD (bit-banged, so it works even
+ * when the crash happened inside the SPI/LCD driver or before it started).
+ */
+
+#ifdef CONFIG_DEBUG_FEATURES
+#  define CARDPUTER_PANIC_SCREEN 1
+#  include <nuttx/notifier.h>
+#  include <nuttx/panic_notifier.h>
+#  include <nuttx/sched.h>
 #endif
 
 /****************************************************************************
@@ -662,6 +682,344 @@ static void gtext_right(int rx, int y, FAR const char *s, uint16_t fg)
 }
 
 /****************************************************************************
+ * Boot screen
+ ****************************************************************************/
+
+#define BOOT_LINES (ROWS - 1)
+
+static char          g_boot_log[BOOT_LINES][COLS + 1];
+static int           g_boot_n;
+static volatile bool g_boot_screen = true;   /* until the menu takes over */
+
+static void compose_boot(void)
+{
+  gfx_fill_rect(0, 0, LCD_W, BAR_H, COL_SEL_BG);
+  gtext(4, 0, "NuttX boot", COL_SEL_FG);
+  for (int i = 0; i < g_boot_n; i++)
+    gtext(0, (i + 1) * FONT_H, g_boot_log[i],
+          i == g_boot_n - 1 ? COL_SEL_FG : COL_FG);
+}
+
+static void boot_step(FAR const char *fmt, ...)
+{
+  char line[COLS + 1];
+  va_list ap;
+  size_t n;
+
+  if (!g_boot_screen) return;
+
+  va_start(ap, fmt);
+  vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+  n = strlen(line);
+  while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+    line[--n] = '\0';
+
+  nxmutex_lock(&g_con_mutex);
+  if (g_boot_screen)
+    {
+      if (g_boot_n == BOOT_LINES)
+        {
+          memmove(g_boot_log[0], g_boot_log[1],
+                  sizeof(g_boot_log[0]) * (BOOT_LINES - 1));
+          g_boot_n--;
+        }
+      snprintf(g_boot_log[g_boot_n++], sizeof(g_boot_log[0]), "%s", line);
+      gfx_render_all(compose_boot);          /* no-op until the LCD is up */
+    }
+  nxmutex_unlock(&g_con_mutex);
+}
+
+/* The menu is about to be drawn: stop drawing boot steps. */
+
+static void boot_screen_end(void)
+{
+  nxmutex_lock(&g_con_mutex);
+  g_boot_screen = false;
+  nxmutex_unlock(&g_con_mutex);
+}
+
+/****************************************************************************
+ * Bit-banged LCD
+ *
+ *   Drives the ST7789 through plain GPIOs, independent of NuttX's SPI and
+ *   LCD drivers and of the OS itself.  Used before the OS starts (to prove
+ *   that NuttX runs at all) and from the panic handler.  Each use takes the
+ *   pins away from SPI2; board_lcd_initialize() takes them back.
+ ****************************************************************************/
+
+#define PIN_LCD_RST   33
+#define PIN_LCD_DC    34
+#define PIN_LCD_MOSI  35
+#define PIN_LCD_SCLK  36
+#define PIN_LCD_CS    37
+#define PIN_LCD_BL    38
+
+#ifndef SIG_GPIO_OUT_IDX
+#  define SIG_GPIO_OUT_IDX 256               /* ESP32-S3 "simple GPIO" */
+#endif
+
+#if defined(CONFIG_LCD_LANDSCAPE)
+#  define BB_MADCTL 0x70
+#  define BB_XOFF   CONFIG_LCD_ST7789_YOFFSET /* the driver swaps them too */
+#  define BB_YOFF   CONFIG_LCD_ST7789_XOFFSET
+#elif defined(CONFIG_LCD_RLANDSCAPE)
+#  define BB_MADCTL 0xa0
+#  define BB_XOFF   CONFIG_LCD_ST7789_YOFFSET
+#  define BB_YOFF   CONFIG_LCD_ST7789_XOFFSET
+#else
+#  define BB_MADCTL 0x70
+#  define BB_XOFF   40
+#  define BB_YOFF   53
+#endif
+
+static void bb_byte(uint8_t b)
+{
+  for (int i = 0; i < 8; i++, b <<= 1)
+    {
+      esp_gpiowrite(PIN_LCD_MOSI, (b & 0x80) != 0);
+      esp_gpiowrite(PIN_LCD_SCLK, 1);
+      esp_gpiowrite(PIN_LCD_SCLK, 0);
+    }
+}
+
+static void bb_cmd(uint8_t cmd, FAR const uint8_t *data, int n)
+{
+  esp_gpiowrite(PIN_LCD_CS, 0);
+  esp_gpiowrite(PIN_LCD_DC, 0);
+  bb_byte(cmd);
+  esp_gpiowrite(PIN_LCD_DC, 1);
+  for (int i = 0; i < n; i++) bb_byte(data[i]);
+  esp_gpiowrite(PIN_LCD_CS, 1);
+}
+
+/* Grab the LCD pins and (re)initialise the panel.  hw_reset pulses RST,
+ * which is safe before the OS runs; in a panic we keep the panel state.
+ */
+
+static void bb_lcd_begin(bool hw_reset)
+{
+  static const uint8_t pins[] =
+  {
+    PIN_LCD_RST, PIN_LCD_DC, PIN_LCD_MOSI, PIN_LCD_SCLK, PIN_LCD_CS,
+    PIN_LCD_BL
+  };
+  uint8_t v;
+
+  for (size_t i = 0; i < sizeof(pins); i++)
+    {
+      esp_configgpio(pins[i], OUTPUT);
+      esp_gpio_matrix_out(pins[i], SIG_GPIO_OUT_IDX, false, false);
+    }
+
+  esp_gpiowrite(PIN_LCD_CS, 1);
+  esp_gpiowrite(PIN_LCD_SCLK, 0);
+  esp_gpiowrite(PIN_LCD_RST, 1);
+  esp_gpiowrite(PIN_LCD_BL, 1);
+  if (hw_reset)
+    {
+      esp_gpiowrite(PIN_LCD_RST, 0); up_mdelay(10);
+      esp_gpiowrite(PIN_LCD_RST, 1); up_mdelay(120);
+    }
+
+  bb_cmd(0x11, NULL, 0); up_mdelay(120);    /* SLPOUT */
+  v = 0x55;      bb_cmd(0x3a, &v, 1);       /* COLMOD 16 bpp */
+  v = BB_MADCTL; bb_cmd(0x36, &v, 1);       /* MADCTL, same as the driver */
+#ifdef CONFIG_LCD_ST7789_INVCOLOR
+  bb_cmd(0x21, NULL, 0);                    /* INVON */
+#else
+  bb_cmd(0x20, NULL, 0);                    /* INVOFF */
+#endif
+  bb_cmd(0x13, NULL, 0);                    /* NORON */
+  bb_cmd(0x29, NULL, 0);                    /* DISPON */
+}
+
+/* Render a whole frame with `fn` through the band buffer, bit-banged. */
+
+static void bb_frame(compose_t fn)
+{
+  const uint8_t ca[4] = { (BB_XOFF) >> 8, (BB_XOFF) & 0xff,
+                          (BB_XOFF + LCD_W - 1) >> 8,
+                          (BB_XOFF + LCD_W - 1) & 0xff };
+  const uint8_t ra[4] = { (BB_YOFF) >> 8, (BB_YOFF) & 0xff,
+                          (BB_YOFF + LCD_H - 1) >> 8,
+                          (BB_YOFF + LCD_H - 1) & 0xff };
+
+  bb_cmd(0x2a, ca, 4);                      /* CASET */
+  bb_cmd(0x2b, ra, 4);                      /* RASET */
+
+  esp_gpiowrite(PIN_LCD_CS, 0);
+  esp_gpiowrite(PIN_LCD_DC, 0);
+  bb_byte(0x2c);                            /* RAMWR */
+  esp_gpiowrite(PIN_LCD_DC, 1);
+
+  for (int y = 0; y < LCD_H; y += BAND_H)
+    {
+      int h = LCD_H - y < BAND_H ? LCD_H - y : BAND_H;
+
+      g_by0 = y;
+      g_by1 = y + h - 1;
+      memset(g_band, 0, sizeof(g_band));
+      fn();
+      for (int i = 0; i < h * LCD_W; i++)
+        {
+          bb_byte((uint8_t)(g_band[i] >> 8));
+          bb_byte((uint8_t)g_band[i]);
+        }
+    }
+
+  esp_gpiowrite(PIN_LCD_CS, 1);
+  g_by0 = 0;
+  g_by1 = -1;
+}
+
+/* 8x8 text: the 8x16 font squashed by OR-ing row pairs (still readable),
+ * 30 columns x 16 lines.
+ */
+
+static void gtext_small(int x, int y, FAR const char *s, uint16_t fg)
+{
+  if (!gfx_band_hits(y, 8)) return;
+  for (; *s && x < LCD_W; s++, x += 8)
+    {
+      unsigned char u = (unsigned char)*s;
+      if (u < GFX_FONT_FIRST || u > GFX_FONT_LAST) continue;
+      FAR const uint8_t *g = &g_font8x16[(u - GFX_FONT_FIRST) * GFX_FONT_H];
+      for (int r = 0; r < 8; r++)
+        {
+          int py = y + r;
+          uint8_t bits = (uint8_t)(g[2 * r] | g[2 * r + 1]);
+          if (!bits || py < g_by0 || py > g_by1) continue;
+          FAR uint16_t *line = gfx_rowp(py);
+          for (int c = 0; c < 8; c++)
+            if ((bits & (0x80 >> c)) && (unsigned)(x + c) < LCD_W)
+              line[x + c] = fg;
+        }
+    }
+}
+
+/* Very first thing NuttX does (called from esp32s3_board_initialize(),
+ * before the OS starts): light the backlight and draw a frame.  If this
+ * screen does not appear, NuttX never got control from the bootloader.
+ */
+
+static void compose_early(void)
+{
+  gfx_clear(0x001f);                        /* blue */
+  gtext(8, 40, "NuttX started", 0xffff);
+  gtext(8, 64, "(early init)", 0xffff);
+}
+
+void cardputer_early_init(void)
+{
+#ifdef CONFIG_DEBUG_FEATURES
+  bb_lcd_begin(true);
+  bb_frame(compose_early);
+#else
+  esp_configgpio(PIN_LCD_BL, OUTPUT);
+  esp_gpio_matrix_out(PIN_LCD_BL, SIG_GPIO_OUT_IDX, false, false);
+  esp_gpiowrite(PIN_LCD_BL, 1);
+#endif
+}
+
+/****************************************************************************
+ * Panic screen (debug builds)
+ *
+ *   The last syslog lines are kept in a small ring; on a panic they are
+ *   drawn in red together with the task, file:line and PC.
+ ****************************************************************************/
+
+#ifdef CARDPUTER_PANIC_SCREEN
+#define TAIL_LINES 8
+#define PANIC_LINES 16
+
+static char g_tail[TAIL_LINES][COLS + 1];
+static int  g_tail_head;                   /* line being written */
+static int  g_tail_col;
+static char g_panic_txt[PANIC_LINES][COLS + 1];
+static int  g_panic_n;
+static bool g_panic_drawn;
+
+static void tail_putc(int c)
+{
+  if (c == '\r') return;
+  if (c == '\n' || g_tail_col >= COLS)
+    {
+      g_tail_head = (g_tail_head + 1) % TAIL_LINES;
+      g_tail_col = 0;
+      g_tail[g_tail_head][0] = '\0';
+      if (c == '\n') return;
+    }
+  g_tail[g_tail_head][g_tail_col++] = (char)c;
+  g_tail[g_tail_head][g_tail_col] = '\0';
+}
+
+static void panic_line(FAR const char *fmt, ...)
+  __attribute__((format(printf, 1, 2)));
+static void panic_line(FAR const char *fmt, ...)
+{
+  va_list ap;
+  if (g_panic_n >= PANIC_LINES) return;
+  va_start(ap, fmt);
+  vsnprintf(g_panic_txt[g_panic_n++], COLS + 1, fmt, ap);
+  va_end(ap);
+}
+
+static void compose_panic(void)
+{
+  gfx_clear(0xa000);                        /* dark red */
+  for (int i = 0; i < g_panic_n; i++)
+    gtext_small(0, i * 8 + 2, g_panic_txt[i], i == 0 ? 0xffe0 : 0xffff);
+}
+
+static int panic_screen_cb(FAR struct notifier_block *nb,
+                           unsigned long action, FAR void *data)
+{
+  FAR struct panic_notifier_s *p = data;
+  FAR const char *f;
+
+  UNUSED(nb);
+  if (g_panic_drawn || action == PANIC_KERNEL_FINAL || p == NULL)
+    return 0;
+  g_panic_drawn = true;
+
+  f = p->filename ? strrchr(p->filename, '/') : NULL;
+  f = f ? f + 1 : (p->filename ? p->filename : "?");
+
+  panic_line("*** CRASH *** photo this");
+#if CONFIG_TASK_NAME_SIZE > 0
+  panic_line("task %s", p->rtcb ? p->rtcb->name : "?");
+#endif
+  panic_line("%s:%d", f, p->linenum);
+  if (p->msg) panic_line("%s", p->msg);
+  if (p->regs)
+    {
+      FAR uint32_t *r = p->regs;
+      panic_line("PC %08" PRIx32 " A0 %08" PRIx32, r[REG_PC], r[REG_A0]);
+      panic_line("EXC %" PRIu32 " VADDR %08" PRIx32,
+                 r[REG_EXCCAUSE], r[REG_EXCVADDR]);
+    }
+  if (g_boot_n > 0)
+    panic_line("step: %s", g_boot_log[g_boot_n - 1]);
+  panic_line("--- last log ---");
+  for (int i = 1; i <= TAIL_LINES; i++)
+    {
+      FAR const char *t = g_tail[(g_tail_head + i) % TAIL_LINES];
+      if (t[0]) panic_line("%s", t);
+    }
+
+  bb_lcd_begin(false);
+  bb_frame(compose_panic);
+  return 0;
+}
+
+static struct notifier_block g_panic_nb =
+{
+  .notifier_call = panic_screen_cb,
+};
+#endif /* CARDPUTER_PANIC_SCREEN */
+
+/****************************************************************************
  * Vector app icons
  ****************************************************************************/
 
@@ -966,6 +1324,9 @@ static volatile bool g_usj_dead;
 static int usj_syslog_putc(FAR struct syslog_channel_s *ch, int c)
 {
   UNUSED(ch);
+#ifdef CARDPUTER_PANIC_SCREEN
+  tail_putc(c);
+#endif
   if (g_usj_dead) return c;
   for (int i = 0; i < 200000; i++)
     {
@@ -1101,6 +1462,22 @@ static uint8_t soft_i2c_read_byte(bool ack)
   soft_i2c_delay(); esp_gpiowrite(PIN_SCL,1);
   soft_i2c_delay(); esp_gpiowrite(PIN_SCL,0);
   return byte;
+}
+/* Free a bus left mid-transfer (e.g. by the firmware that rebooted into
+ * us): clock SCL until the slave releases SDA, then send a STOP.
+ */
+
+static void soft_i2c_recover(void)
+{
+  esp_configgpio(PIN_SDA,INPUT|PULLUP);
+  esp_configgpio(PIN_SCL,OUTPUT); esp_gpiowrite(PIN_SCL,1);
+  soft_i2c_delay();
+  for (int i=0;i<9;i++)
+    {
+      esp_gpiowrite(PIN_SCL,0); soft_i2c_delay();
+      esp_gpiowrite(PIN_SCL,1); soft_i2c_delay();
+    }
+  soft_i2c_stop();
 }
 static bool soft_tca8418_write(uint8_t reg, uint8_t val)
 {
@@ -3524,12 +3901,30 @@ static int kbd_nsh_thread(int argc, FAR char *argv[])
   esp_configgpio(11,INPUT|PULLUP);
   usleep(300 * 1000);
 
-  if (!soft_tca8418_write(0x01,0x80))
+  /* Keep trying: giving up here left the keyboard dead for good. */
+
+  for (int tries = 0; ; tries++)
     {
-      BTRACE("kbd: TCA8418 not answering on GPIO8/9\n");
-      return -ENODEV;
+      soft_i2c_recover();
+      if (soft_tca8418_write(0x01,0x80)) break;
+      if (tries == 0) BTRACE("kbd: no TCA8418, retrying\n");
+      usleep(500 * 1000);
     }
   BTRACE("kbd: TCA8418 ok\n");
+
+  /* Another firmware (M5 Launcher) may have configured the chip; it keeps
+   * its registers across our reset.  Return the GPIO/event registers to
+   * their power-on values (0) before applying our setup.
+   */
+
+  for (uint8_t r=0x1A;r<=0x2E;r++) soft_tca8418_write(r,0x00);
+  for (int i=0;i<16;i++)
+    {
+      if (!soft_tca8418_read(0x03,&reg_val) || (reg_val&0x0F)==0) break;
+      soft_tca8418_read(0x04,&reg_val);
+    }
+  soft_tca8418_write(0x02,0x1F);
+
   soft_tca8418_write(0x11,0xFF); soft_tca8418_write(0x12,0xFF);
   soft_tca8418_write(0x13,0x03); soft_tca8418_write(0x1D,0xFF);
   soft_tca8418_write(0x1E,0xFF); soft_tca8418_write(0x29,0xFF);
@@ -3716,6 +4111,10 @@ static int lcd_cons_thread(int argc, FAR char *argv[])
   UNUSED(argc); UNUSED(argv);
 
   BTRACE("lcd_cons: first frame\n");
+#ifdef CONFIG_DEBUG_FEATURES
+  usleep(3000 * 1000);                       /* leave the boot log readable */
+#endif
+  boot_screen_end();
   battery_refresh();
   con_clear_full();
   menu_render();
@@ -3863,9 +4262,15 @@ int board_lcd_initialize(void)
 int esp32s3_bringup(void)
 {
   int ret;
+#if defined(CONFIG_LCD)
+  int lcd_ret;
+#endif
 
 #ifdef CARDPUTER_USB_SYSLOG
   syslog_channel_register(&g_usj_syslog_channel);  /* needs MAX_CHANNELS 4 */
+#endif
+#ifdef CARDPUTER_PANIC_SCREEN
+  panic_notifier_chain_register(&g_panic_nb);
 #endif
   BTRACE("bringup start\n");
   board_reclaim_gpios();                     /* before any esp_gpiowrite() */
@@ -3875,14 +4280,18 @@ int esp32s3_bringup(void)
   nx_mount(NULL,"/proc","procfs",0,NULL);
 #endif
 
+  /* LCD first, so every later step shows up on the boot screen. */
+
+#if defined(CONFIG_LCD)
+  lcd_ret=board_lcd_initialize();
+  BTRACE("lcd init %d\n", lcd_ret);
+#endif
+
 #ifdef CONFIG_ESP32S3_SPIFLASH
+  BTRACE("spiflash init...\n");
   ret=board_spiflash_init();
   if (ret<0) syslog(LOG_ERR,"board_spiflash_init failed: %d\n",ret);
 #endif
-
-  /* Wi-Fi first: esp_wifi_init() wants a large contiguous heap block, which
-   * is easiest to get before the rest of the system starts allocating.
-   */
 
 #ifdef CONFIG_ESPRESSIF_HR_TIMER
   /* The Wi-Fi PHY creates esp_timers on first RF enable; they fail with
@@ -3896,16 +4305,19 @@ int esp32s3_bringup(void)
 #endif
 
 #ifdef CONFIG_ESPRESSIF_WIFI
+  /* esp_wifi_init() wants a large contiguous heap block: still early, the
+   * LCD driver above only allocated a few bytes.
+   */
+
+  BTRACE("wifi init...\n");
   ret=board_wlan_init();
   g_wlan_init_ret=ret;
-  BTRACE("board_wlan_init %d\n", ret);
+  BTRACE("wifi init %d\n", ret);
   if (ret<0) syslog(LOG_ERR,"board_wlan_init failed: %d\n",ret);
 #endif
 
 #if defined(CONFIG_LCD)
-  ret=board_lcd_initialize();
-  BTRACE("board_lcd_initialize %d\n", ret);
-  if (ret<0) return ret;
+  if (lcd_ret<0) return lcd_ret;
 
   ringdev_init(&g_kbd_ring, g_kbd_buf, sizeof(g_kbd_buf));
   ringdev_init(&g_out_ring, g_out_buf, sizeof(g_out_buf));
@@ -3919,6 +4331,7 @@ int esp32s3_bringup(void)
 #endif
 
 #if defined(CONFIG_ESPRESSIF_ADC)||defined(CONFIG_ESP32S3_ADC)
+  BTRACE("adc init...\n");
   ret=board_adc_init();
   if (ret<0) syslog(LOG_ERR,"board_adc_init failed: %d\n",ret);
 #endif
