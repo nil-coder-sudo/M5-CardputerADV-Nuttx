@@ -978,6 +978,52 @@ static void board_clear_interrupts(void)
     }
 }
 
+/* Watchdogs.  ESP-IDF's esp_restart() -- how Launcher starts us -- arms
+ * the RTC watchdog (~1 s, flash-boot mode) before resetting, and leaves it
+ * write-protected.  NuttX's esp32s3_wdt_early_deinit() clears the enable
+ * bit *without* writing the unlock key first, so the write is ignored and
+ * the chip resets about a second after NuttX starts: the screen shows the
+ * early-init frame and the device reboots.  (fix_legacy_ld.py also patches
+ * that function in the NuttX tree.)  Turn off RWDT and both MWDTs here,
+ * properly unlocked, and keep the super watchdog on auto-feed.
+ */
+
+#define WDT_WKEY            0x50d83aa1u
+#define SWD_WKEY            0x8f1d312au
+#define RTC_WDTCONFIG0      0x60008098u
+#define RTC_WDTFEED         0x600080acu
+#define RTC_WDTWPROTECT     0x600080b0u
+#define RTC_SWD_CONF        0x600080b4u
+#define RTC_SWD_WPROTECT    0x600080b8u
+#define RTC_RESET_STATE     0x60008038u
+#define TIMG_WDTCONFIG0(b)  ((b) + 0x48u)
+#define TIMG_WDTWPROTECT(b) ((b) + 0x64u)
+
+#define REG32(a) (*(volatile uint32_t *)(a))
+
+static uint8_t g_reset_cause;                /* RTC_CNTL reset reason */
+
+static void board_disable_watchdogs(void)
+{
+  static const uint32_t timg[] = { 0x6001f000u, 0x60020000u };
+
+  REG32(RTC_WDTWPROTECT) = WDT_WKEY;
+  REG32(RTC_WDTFEED)     = 1u << 31;
+  REG32(RTC_WDTCONFIG0) &= ~((1u << 31) | (1u << 12));  /* EN, FLASHBOOT */
+  REG32(RTC_WDTWPROTECT) = 0;
+
+  for (size_t i = 0; i < sizeof(timg) / sizeof(timg[0]); i++)
+    {
+      REG32(TIMG_WDTWPROTECT(timg[i])) = WDT_WKEY;
+      REG32(TIMG_WDTCONFIG0(timg[i])) &= ~((1u << 31) | (1u << 14));
+      REG32(TIMG_WDTWPROTECT(timg[i])) = 0;
+    }
+
+  REG32(RTC_SWD_WPROTECT) = SWD_WKEY;
+  REG32(RTC_SWD_CONF)    |= 1u << 31;                    /* auto-feed */
+  REG32(RTC_SWD_WPROTECT) = 0;
+}
+
 /* Very first thing NuttX does (called from esp32s3_board_initialize(),
  * before the OS starts): light the backlight and draw a frame.  If this
  * screen does not appear, NuttX never got control from the bootloader.
@@ -985,13 +1031,19 @@ static void board_clear_interrupts(void)
 
 static void compose_early(void)
 {
+  char buf[COLS + 1];
+
   gfx_clear(0x001f);                        /* blue */
-  gtext(8, 40, "NuttX started", 0xffff);
-  gtext(8, 64, "(early init)", 0xffff);
+  gtext(8, 32, "NuttX started", 0xffff);
+  gtext(8, 56, "(early init)", 0xffff);
+  snprintf(buf, sizeof(buf), "reset cause %u", g_reset_cause);
+  gtext(8, 88, buf, 0xffe0);
 }
 
 void cardputer_early_init(void)
 {
+  board_disable_watchdogs();                 /* first: RWDT is ~1 s away */
+  g_reset_cause = (uint8_t)(REG32(RTC_RESET_STATE) & 0x3f);
   board_clear_interrupts();
   board_reset_peripherals();
 #ifdef CONFIG_DEBUG_FEATURES
@@ -4359,8 +4411,9 @@ int esp32s3_bringup(void)
 #ifdef CARDPUTER_PANIC_SCREEN
   panic_notifier_chain_register(&g_panic_nb);
 #endif
-  board_reset_peripherals();                 /* also without the hook */
-  BTRACE("bringup start\n");
+  board_disable_watchdogs();                 /* also without the hook */
+  board_reset_peripherals();
+  BTRACE("bringup start (rst %u)\n", g_reset_cause);
   board_reclaim_gpios();                     /* before any esp_gpiowrite() */
   BTRACE("gpios reclaimed\n");
 

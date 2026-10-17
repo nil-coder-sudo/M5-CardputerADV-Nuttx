@@ -212,6 +212,14 @@ it starts. `cardputer_early_init()` clears the interrupt matrix and GPIO
 interrupts and resets those peripherals before the OS starts. It is
 harmless when flashed normally.
 
+`fix_legacy_ld.py` also patches NuttX's `esp32s3_wdt_early_deinit()`:
+`esp_restart()` arms the RTC watchdog (about one second) and write-protects
+it; NuttX cleared the enable bit without unlocking first, so the chip reset
+about a second after NuttX started (the early-init screen, then a reboot).
+`cardputer_early_init()` turns the watchdogs off as well, and in debug
+builds the early-init screen shows the last reset cause (12 = software
+restart from Launcher, 9/16 = RTC watchdog).
+
 **Finding out where a boot stops (no PC needed).** Every bring-up step is
 listed on a *NuttX boot* screen until the menu appears, so a boot that hangs
 shows the last step reached. With `CONFIG_DEBUG_FEATURES=y` and the hook
